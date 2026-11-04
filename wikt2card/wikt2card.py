@@ -69,6 +69,16 @@ def get_deck_name(language: str, deck_override: Optional[str] = None) -> str:
 # ============================================================================
 
 ANKI_CONNECT_URL = "http://localhost:8765"
+REQUEST_TIMEOUT = 30  # seconds
+
+SESSION = requests.Session()
+SESSION.headers["User-Agent"] = (
+    "wikt2card/1.0 (https://github.com/0x4A0D4A/flashcard_generators)"
+)
+
+
+class AnkiError(Exception):
+    """Raised when AnkiConnect cannot be reached or reports an error"""
 
 
 def invoke_anki(action: str, **params) -> Dict:
@@ -78,42 +88,36 @@ def invoke_anki(action: str, **params) -> Dict:
         "version": 6,
         "params": params
     }
-    
+
     try:
-        response = requests.post(ANKI_CONNECT_URL, json=payload)
+        response = SESSION.post(ANKI_CONNECT_URL, json=payload, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         result = response.json()
-        
-        if len(result) != 2:
-            raise Exception("Response has unexpected number of fields")
-        if "error" not in result:
-            raise Exception("Response is missing required error field")
-        if "result" not in result:
-            raise Exception("Response is missing required result field")
-        if result["error"] is not None:
-            raise Exception(result["error"])
-        
-        return result["result"]
     except requests.exceptions.ConnectionError:
-        print("Error: Could not connect to AnkiConnect. Is Anki running?")
-        print("Make sure the AnkiConnect add-on is installed.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error communicating with Anki: {e}")
-        sys.exit(1)
+        raise AnkiError(
+            "Could not connect to AnkiConnect. Is Anki running, and is the "
+            "AnkiConnect add-on installed?"
+        )
+    except (requests.exceptions.RequestException, ValueError) as e:
+        raise AnkiError(f"Error communicating with Anki: {e}")
+
+    if len(result) != 2:
+        raise AnkiError("AnkiConnect response has unexpected number of fields")
+    if "error" not in result:
+        raise AnkiError("AnkiConnect response is missing required error field")
+    if "result" not in result:
+        raise AnkiError("AnkiConnect response is missing required result field")
+    if result["error"] is not None:
+        raise AnkiError(result["error"])
+
+    return result["result"]
 
 
 def check_anki_connection():
     """Verify that AnkiConnect is available"""
-    try:
-        version = invoke_anki("version")
-        if version < 6:
-            print(f"Warning: AnkiConnect version {version} may not be supported")
-    except SystemExit:
-        raise
-    except Exception as e:
-        print(f"Error: Could not verify AnkiConnect: {e}")
-        sys.exit(1)
+    version = invoke_anki("version")
+    if version < 6:
+        print(f"Warning: AnkiConnect version {version} may not be supported")
 
 
 def deck_exists(deck_name: str) -> bool:
@@ -174,12 +178,7 @@ def can_add_note(note: Dict) -> bool:
 
 def add_note_to_anki(note: Dict):
     """Add a note to Anki"""
-    try:
-        result = invoke_anki("addNote", note=note)
-        return result
-    except Exception as e:
-        print(f"Error adding note: {e}")
-        sys.exit(1)
+    return invoke_anki("addNote", note=note)
 
 
 # ============================================================================
@@ -194,10 +193,7 @@ def fetch_wiktionary_entry(word: str) -> str:
     print(f"URL: {url}")
     
     try:
-        response = requests.get(
-            url,
-            headers={'User-Agent': 'wikt2card/1.0 (https://github.com/user/wikt2card)'}
-        )
+        response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         
         print(f"Status: {response.status_code}")
@@ -664,7 +660,19 @@ Examples:
     parser.add_argument('--deck', help='Override the deck name')
     
     args = parser.parse_args()
-    
+
+    try:
+        run(args)
+    except AnkiError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(130)
+
+
+def run(args):
+    """Fetch, preview and (on confirmation) add a card"""
     language = args.language.lower()
     word = args.word
     deck_name = get_deck_name(language, args.deck)
