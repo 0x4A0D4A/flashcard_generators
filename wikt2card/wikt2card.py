@@ -57,7 +57,7 @@ def get_deck_name(language: str, deck_override: Optional[str] = None) -> str:
         return config["defaults"][language.lower()]
     
     # Default: "wikt2card <Language>" with capitalized language
-    return f"wikt2card {language.capitalize()}"
+    return f"wikt2card {language_title(language)}"
 
 
 # ============================================================================
@@ -196,6 +196,16 @@ class WiktError(Exception):
     """Raised when a Wiktionary entry cannot be fetched or parsed"""
 
 
+def language_title(language: str) -> str:
+    """Title-case every word of a language name ('old irish' -> 'Old Irish')"""
+    return ' '.join(part.capitalize() for part in language.split())
+
+
+def language_heading_id(language: str) -> str:
+    """The h2 id Wiktionary uses for a language ('old irish' -> 'Old_Irish')"""
+    return language_title(language).replace(' ', '_')
+
+
 def fetch_wiktionary_entry(word: str) -> str:
     """Fetch the HTML content from Wiktionary"""
     url = f"https://en.wiktionary.org/wiki/{quote(word.replace(' ', '_'), safe='')}"
@@ -306,11 +316,12 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
         log.debug(f"  {i+1}. id='{h2_id}' text='{h2_text}'")
     
     # Find the language heading by ID attribute
-    language_heading = soup.find('h2', id=language.capitalize())
-    
+    heading_id = language_heading_id(language)
+    language_heading = soup.find('h2', id=heading_id)
+
     if not language_heading:
         # Fallback: try finding by text content
-        log.debug(f"\nCouldn't find h2 with id='{language.capitalize()}', trying text match...")
+        log.debug(f"\nCouldn't find h2 with id='{heading_id}', trying text match...")
         for h2 in all_h2s:
             if h2.get_text().strip().lower() == language.lower():
                 language_heading = h2
@@ -320,7 +331,7 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
     if not language_heading:
         available = [h2.get('id') for h2 in all_h2s if h2.get('id')]
         raise WiktError(
-            f"Could not find a {language.capitalize()} section for '{word}'. "
+            f"Could not find a {language_title(language)} section for '{word}'. "
             f"Available language sections: {available}. "
             f"Check https://en.wiktionary.org/wiki/{quote(word.replace(' ', '_'), safe='')}"
         )
@@ -526,7 +537,7 @@ def format_for_display(info: Dict) -> str:
     lines = []
     lines.append("=" * 70)
     lines.append(f"WORD: {info['word']}")
-    lines.append(f"LANGUAGE: {info['language'].capitalize()}")
+    lines.append(f"LANGUAGE: {language_title(info['language'])}")
     lines.append("=" * 70)
     lines.append("")
     
