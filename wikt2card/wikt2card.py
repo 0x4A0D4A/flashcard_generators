@@ -12,13 +12,14 @@ Examples:
 
 import sys
 import json
+import re
 import os
 import argparse
 import requests
 import hashlib
 from html import escape as html_escape
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from bs4 import BeautifulSoup
 from typing import Optional, Dict, List, Tuple
 
@@ -130,6 +131,17 @@ def create_deck_if_needed(deck_name: str):
     invoke_anki("createDeck", deck=deck_name)
 
 
+def audio_filename(audio_url: str) -> str:
+    """Derive a safe, collision-resistant media filename from an audio URL.
+
+    Wikimedia file names already encode the language and word (e.g.
+    Fr-eau.ogg.mp3), and keeping them preserves the real extension.
+    """
+    base = unquote(urlparse(audio_url).path.rsplit('/', 1)[-1])
+    base = re.sub(r'[^\w.\-]', '_', base) or 'audio'
+    return f"wikt2card_{base}"
+
+
 def build_note(deck_name: str, word: str, details: str, audio_url: Optional[str] = None) -> Dict:
     """Build the AnkiConnect note payload.
 
@@ -158,7 +170,7 @@ def build_note(deck_name: str, word: str, details: str, audio_url: Optional[str]
     if audio_url:
         note["audio"] = [{
             "url": audio_url,
-            "filename": f"{word}.mp3",
+            "filename": audio_filename(audio_url),
             "fields": ["Front"]
         }]
 
