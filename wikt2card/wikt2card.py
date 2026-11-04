@@ -59,7 +59,7 @@ def get_deck_name(language: str, deck_override: Optional[str] = None) -> str:
         return config["defaults"][language.lower()]
     
     # Default: "wikt2card <Language>" with capitalized language
-    return f"Languages::{language.capitalize()}::Mining"
+    return f"wikt2card {language.capitalize()}"
 
 
 # ============================================================================
