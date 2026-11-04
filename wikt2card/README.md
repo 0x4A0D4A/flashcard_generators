@@ -37,8 +37,8 @@ chmod +x wikt2card.py
 # Add to ~/.bashrc or ~/.zshrc
 alias wikt2card='/path/to/wikt2card.py'
 
-# Or create a symlink
-sudo ln -s /path/to/wikt2card.py /usr/local/bin/wikt2card
+# Or symlink it somewhere on your PATH
+ln -s /path/to/wikt2card.py ~/.local/bin/wikt2card
 ```
 
 ## Usage
@@ -57,6 +57,28 @@ sudo ln -s /path/to/wikt2card.py /usr/local/bin/wikt2card
 ```bash
 ./wikt2card.py french manger --deck "wikt2card French::Verbs"
 ```
+
+**Multi-word language names:**
+```bash
+./wikt2card.py "old irish" <word>
+```
+
+**Skip the confirmation prompt:**
+```bash
+./wikt2card.py french eau --yes
+```
+
+**Use another note type** (it must have `Front` and `Back` fields):
+```bash
+./wikt2card.py french eau --note-type "Basic (and reversed card)"
+```
+
+**Show fetch/parse debug output:**
+```bash
+./wikt2card.py french eau --verbose
+```
+
+**Options:** `--deck NAME`, `--note-type NAME`, `-y/--yes`, `-v/--verbose`.
 
 ## Configuration
 
@@ -85,6 +107,8 @@ If no default is configured, the deck name will be `wikt2card <Language>`.
 
 ## Card Format
 
+Cards are tagged `wikt2card` and `wikt2card::<language>` (e.g. `wikt2card::french`).
+
 **Front:** The word (with audio pronunciation if available)
 
 **Back:** Complete entry including:
@@ -97,7 +121,16 @@ If no default is configured, the deck name will be `wikt2card <Language>`.
 
 ## Duplicate Detection
 
-The script checks if a card with the same word already exists in the target deck before adding. It uses AnkiConnect's duplicate detection scoped to the specific deck (not checking child decks).
+The script checks if a card with the same word already exists in the target deck before adding. It uses AnkiConnect's duplicate detection scoped to the specific deck (not checking child decks); the check and the final add use identical settings. The deck is only created once you confirm the card, so declining or a failed lookup leaves no empty deck behind.
+
+## Tests
+
+The tests run offline against saved Wiktionary pages and a fake AnkiConnect, so Anki does not need to be running:
+
+```bash
+pip3 install -r requirements-dev.txt
+python3 -m pytest tests
+```
 
 ## Supported Languages
 
