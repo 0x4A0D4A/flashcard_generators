@@ -3,7 +3,7 @@
 wikt2card - Fetch Wiktionary entries and add them directly to Anki
 
 Usage:
-    wikt2card <language> <word> [--deck DECK_NAME]
+    wikt2card <language> <word> [--deck DECK_NAME] [--note-type NAME] [-y] [-v]
 
 Examples:
     wikt2card french eau
@@ -67,6 +67,7 @@ def get_deck_name(language: str, deck_override: Optional[str] = None) -> str:
 
 ANKI_CONNECT_URL = "http://localhost:8765"
 REQUEST_TIMEOUT = 30  # seconds
+DEFAULT_NOTE_TYPE = "Basic"  # must have "Front" and "Back" fields
 
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = (
@@ -138,7 +139,8 @@ def audio_filename(audio_url: str) -> str:
     return f"wikt2card_{base}"
 
 
-def build_note(deck_name: str, word: str, details: str, audio_url: Optional[str] = None) -> Dict:
+def build_note(deck_name: str, word: str, details: str, audio_url: Optional[str] = None,
+               language: str = '', note_type: str = DEFAULT_NOTE_TYPE) -> Dict:
     """Build the AnkiConnect note payload.
 
     Used for both the duplicate check and the actual add, so that both use
@@ -146,7 +148,7 @@ def build_note(deck_name: str, word: str, details: str, audio_url: Optional[str]
     """
     note = {
         "deckName": deck_name,
-        "modelName": "Basic",
+        "modelName": note_type,
         "fields": {
             "Front": word,
             "Back": details
@@ -159,7 +161,9 @@ def build_note(deck_name: str, word: str, details: str, audio_url: Optional[str]
                 "checkChildren": False
             }
         },
-        "tags": ["wikt2card"]
+        "tags": ["wikt2card"] + (
+            [f"wikt2card::{language.replace(' ', '_').lower()}"] if language else []
+        )
     }
 
     # Add audio if available
@@ -706,6 +710,11 @@ Examples:
     parser.add_argument('language', help='Language of the word (e.g., french, spanish)')
     parser.add_argument('word', help='Word to look up')
     parser.add_argument('--deck', help='Override the deck name')
+    parser.add_argument('--note-type', default=DEFAULT_NOTE_TYPE,
+                        help='Anki note type to use; must have "Front" and "Back" fields '
+                             f'(default: {DEFAULT_NOTE_TYPE})')
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='Add the card without asking for confirmation')
     
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Show detailed fetch/parse debug output')
@@ -750,7 +759,7 @@ def run(args):
     
     # Check for duplicates (a deck that doesn't exist yet can't contain any)
     print(f"\nChecking for duplicates in deck '{deck_name}'...")
-    note = build_note(deck_name, word, anki_details, audio_url)
+    note = build_note(deck_name, word, anki_details, audio_url, language, args.note_type)
     if deck_exists(deck_name) and not can_add_note(note):
         print(f"Error: Card for '{word}' already exists in deck '{deck_name}'")
         sys.exit(1)
@@ -763,7 +772,10 @@ def run(args):
     
     # Prompt for confirmation
     print(f"\nTarget deck: {deck_name}")
-    response = input("\nAdd this card to Anki? (y/n): ").strip().lower()
+    if args.yes:
+        response = 'y'
+    else:
+        response = input("\nAdd this card to Anki? (y/n): ").strip().lower()
     
     if response == 'y' or response == 'yes':
         print("\nAdding card to Anki...")
