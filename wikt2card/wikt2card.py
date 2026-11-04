@@ -13,15 +13,16 @@ Examples:
 import sys
 import json
 import re
-import os
 import argparse
+import logging
 import requests
-import hashlib
 from html import escape as html_escape
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 from bs4 import BeautifulSoup
 from typing import Optional, Dict, List, Tuple
+
+log = logging.getLogger('wikt2card')
 
 
 # ============================================================================
@@ -44,12 +45,6 @@ def load_config() -> Dict:
         print(f"Warning: Could not load config file: {e}")
         return {"defaults": {}}
 
-
-def save_config(config: Dict):
-    """Save configuration to ~/.config/wikt2card/config.json"""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
 
 
 def get_deck_name(language: str, deck_override: Optional[str] = None) -> str:
@@ -197,30 +192,33 @@ def add_note_to_anki(note: Dict):
 # Wiktionary Fetching and Parsing
 # ============================================================================
 
+class WiktError(Exception):
+    """Raised when a Wiktionary entry cannot be fetched or parsed"""
+
+
 def fetch_wiktionary_entry(word: str) -> str:
     """Fetch the HTML content from Wiktionary"""
     url = f"https://en.wiktionary.org/wiki/{quote(word.replace(' ', '_'), safe='')}"
     
-    print(f"\n=== FETCHING FROM WIKTIONARY ===")
-    print(f"URL: {url}")
+    log.debug(f"\n=== FETCHING FROM WIKTIONARY ===")
+    log.debug(f"URL: {url}")
     
     try:
         response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         
-        print(f"Status: {response.status_code}")
-        print(f"Content length: {len(response.text)} bytes")
-        print(f"Content type: {response.headers.get('content-type', 'unknown')}")
+        log.debug(f"Status: {response.status_code}")
+        log.debug(f"Content length: {len(response.text)} bytes")
+        log.debug(f"Content type: {response.headers.get('content-type', 'unknown')}")
         
         return response.text
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching Wiktionary entry: {e}")
-        sys.exit(1)
+        raise WiktError(f"Error fetching Wiktionary entry: {e}")
 
 
 def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
     """Extract the audio file URL from the pronunciation section"""
-    print(f"\n=== EXTRACTING AUDIO ===")
+    log.debug(f"\n=== EXTRACTING AUDIO ===")
     
     # The language_section is the h2 tag, we need to start from its parent div
     if language_section.parent and language_section.parent.name == 'div' and \
@@ -247,10 +245,10 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
         
         if heading_elem:
             heading_text = heading_elem.get_text().strip()
-            print(f"Checking section: {heading_text}")
+            log.debug(f"Checking section: {heading_text}")
             
             if 'pronunciation' in heading_text.lower():
-                print(f"Found pronunciation section!")
+                log.debug(f"Found pronunciation section!")
                 # Found pronunciation section, look for audio in subsequent siblings
                 audio_section = current.find_next_sibling()
                 while audio_section:
@@ -259,14 +257,14 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
                         break
                     
                     # Look for audio elements
-                    print(f"  Searching in: {audio_section.name}")
+                    log.debug(f"  Searching in: {audio_section.name}")
                     audio_elements = audio_section.find_all('audio')
                     for audio in audio_elements:
-                        print(f"    Found audio tag: {audio}")
+                        log.debug(f"    Found audio tag: {audio}")
                         sources = audio.find_all('source')
                         for source in sources:
                             src = source.get('src')
-                            print(f"      Source: {src}")
+                            log.debug(f"      Source: {src}")
                             if src:
                                 # Prefer mp3, then ogg
                                 if '.mp3' in src or '.ogg' in src:
@@ -276,7 +274,7 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
                                         url = 'https://en.wiktionary.org' + src
                                     else:
                                         url = src
-                                    print(f"      -> Using: {url}")
+                                    log.debug(f"      -> Using: {url}")
                                     return url
                     
                     audio_section = audio_section.find_next_sibling()
@@ -284,7 +282,7 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
         
         current = current.find_next_sibling()
     
-    print(f"No audio found")
+    log.debug(f"No audio found")
     return None
 
 
@@ -295,76 +293,78 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
     """
     soup = BeautifulSoup(html, 'html.parser')
     
-    print(f"\n=== PARSING WIKTIONARY ENTRY ===")
-    print(f"Word: {word}")
-    print(f"Language: {language}")
+    log.debug(f"\n=== PARSING WIKTIONARY ENTRY ===")
+    log.debug(f"Word: {word}")
+    log.debug(f"Language: {language}")
     
     # Find all h2 headings
     all_h2s = soup.find_all('h2')
-    print(f"\nFound {len(all_h2s)} h2 headings:")
+    log.debug(f"\nFound {len(all_h2s)} h2 headings:")
     for i, h2 in enumerate(all_h2s[:10]):  # Show first 10
         h2_id = h2.get('id', 'no-id')
         h2_text = h2.get_text().strip()
-        print(f"  {i+1}. id='{h2_id}' text='{h2_text}'")
+        log.debug(f"  {i+1}. id='{h2_id}' text='{h2_text}'")
     
     # Find the language heading by ID attribute
     language_heading = soup.find('h2', id=language.capitalize())
     
     if not language_heading:
         # Fallback: try finding by text content
-        print(f"\nCouldn't find h2 with id='{language.capitalize()}', trying text match...")
+        log.debug(f"\nCouldn't find h2 with id='{language.capitalize()}', trying text match...")
         for h2 in all_h2s:
             if h2.get_text().strip().lower() == language.lower():
                 language_heading = h2
-                print(f"Found by text: {h2}")
+                log.debug(f"Found by text: {h2}")
                 break
     
     if not language_heading:
-        print(f"\nERROR: Could not find {language.capitalize()} section")
-        print(f"Available language sections: {[h2.get('id') for h2 in all_h2s if h2.get('id')]}")
-        print(f"Check https://en.wiktionary.org/wiki/{word}")
-        sys.exit(1)
+        available = [h2.get('id') for h2 in all_h2s if h2.get('id')]
+        raise WiktError(
+            f"Could not find a {language.capitalize()} section for '{word}'. "
+            f"Available language sections: {available}. "
+            f"Check https://en.wiktionary.org/wiki/{quote(word.replace(' ', '_'), safe='')}"
+        )
     
-    print(f"\nFound language section: {language_heading}")
+    log.debug(f"\nFound language section: {language_heading}")
     
     # Extract audio URL
     audio_url = extract_audio_url(soup, language_heading)
-    print(f"Audio URL: {audio_url}")
+    log.debug(f"Audio URL: {audio_url}")
     
     # The h2 might be wrapped in a div.mw-heading, so start from the right place
     if language_heading.parent and language_heading.parent.name == 'div' and \
        'mw-heading' in language_heading.parent.get('class', []):
         # Start from the wrapper div's next sibling
         start_element = language_heading.parent
-        print(f"H2 is wrapped in div.mw-heading, starting from: {start_element.name}")
+        log.debug(f"H2 is wrapped in div.mw-heading, starting from: {start_element.name}")
     else:
         # Start from the h2 itself
         start_element = language_heading
-        print(f"H2 is not wrapped, starting from: {start_element.name}")
+        log.debug(f"H2 is not wrapped, starting from: {start_element.name}")
     
     # Find all sibling elements until next h2
     content_elements = []
     current = start_element.find_next_sibling()
     
-    print(f"\nCollecting content elements...")
+    log.debug(f"\nCollecting content elements...")
     while current:
         # Stop if we hit another language section (h2 or div containing h2)
         if current.name == 'h2':
-            print(f"Stopped at next h2: {current.get('id')}")
+            log.debug(f"Stopped at next h2: {current.get('id')}")
             break
         if current.name == 'div' and 'mw-heading' in current.get('class', []):
             if current.find('h2'):
-                print(f"Stopped at div containing h2: {current.find('h2').get('id')}")
+                log.debug(f"Stopped at div containing h2: {current.find('h2').get('id')}")
                 break
         
         content_elements.append(current)
         if current.name == 'div' and 'mw-heading' in current.get('class', []):
             inner = current.find(['h3', 'h4'])
             if inner:
-                print(f"  Found section: {inner.get_text().strip()}")
+                log.debug(f"  Found section: {inner.get_text().strip()}")
         current = current.find_next_sibling()
     
-    print(f"Collected {len(content_elements)} elements")
+    log.debug(f"Collected {len(content_elements)} elements")
     
     # Extract structured information
     info = {
@@ -377,13 +377,12 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
         'antonyms': [],
         'related': [],
         'derived': [],
-        'raw_sections': []
     }
     
     current_section = None
     current_pos = None
     
-    print(f"\nParsing content...")
+    log.debug(f"\nParsing content...")
     for i, elem in enumerate(content_elements):
         # Check if this is a section heading (wrapped in div.mw-heading)
         if elem.name == 'div' and 'mw-heading' in elem.get('class', []):
@@ -391,7 +390,7 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
             if heading:
                 section_title = heading.get_text().strip()
                 current_section = section_title.lower()
-                print(f"  Section {i}: {section_title}")
+                log.debug(f"  Section {i}: {section_title}")
                 
                 # Check if this is a part of speech heading
                 pos_keywords = ['noun', 'verb', 'adjective', 'adverb', 'pronoun', 
@@ -499,21 +498,21 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
                 if text and text not in info['related']:
                     info['related'].append(text)
     
-    print(f"\n=== PARSING SUMMARY ===")
-    print(f"Pronunciation entries: {len(info['pronunciation'])}")
-    print(f"Etymology entries: {len(info['etymology'])}")
-    print(f"Definitions by POS:")
+    log.debug(f"\n=== PARSING SUMMARY ===")
+    log.debug(f"Pronunciation entries: {len(info['pronunciation'])}")
+    log.debug(f"Etymology entries: {len(info['etymology'])}")
+    log.debug(f"Definitions by POS:")
     for pos, defs in info['definitions'].items():
-        print(f"  {pos}: {len(defs)} definition(s)")
+        log.debug(f"  {pos}: {len(defs)} definition(s)")
         for j, d in enumerate(defs[:2]):  # Show first 2
             if isinstance(d, dict):
-                print(f"    {j+1}. {d['text'][:60]}...")
+                log.debug(f"    {j+1}. {d['text'][:60]}...")
             else:
-                print(f"    {j+1}. {d[:60]}...")
-    print(f"Synonyms: {len(info['synonyms'])}")
-    print(f"Antonyms: {len(info['antonyms'])}")
-    print(f"Derived terms: {len(info['derived'])}")
-    print(f"Related terms: {len(info['related'])}")
+                log.debug(f"    {j+1}. {d[:60]}...")
+    log.debug(f"Synonyms: {len(info['synonyms'])}")
+    log.debug(f"Antonyms: {len(info['antonyms'])}")
+    log.debug(f"Derived terms: {len(info['derived'])}")
+    log.debug(f"Related terms: {len(info['related'])}")
     
     return info, audio_url
 
@@ -671,11 +670,18 @@ Examples:
     parser.add_argument('word', help='Word to look up')
     parser.add_argument('--deck', help='Override the deck name')
     
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show detailed fetch/parse debug output')
+
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format='%(message)s'
+    )
 
     try:
         run(args)
-    except AnkiError as e:
+    except (AnkiError, WiktError) as e:
         print(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
