@@ -14,6 +14,7 @@ import sys
 import json
 import re
 import argparse
+import copy
 import logging
 import requests
 from html import escape as html_escape
@@ -296,6 +297,81 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
     return None
 
 
+NYM_SECTIONS = {
+    'synonyms': 'synonyms',
+    'antonyms': 'antonyms',
+    'derived': 'derived terms',
+    'related': 'related terms',
+}
+
+
+def clean_text(text: str) -> str:
+    """Collapse whitespace, including the stray spaces left around inline markup"""
+    text = ' '.join(text.split())
+    return re.sub(r'\s+([,.;:!?)])', r'\1', re.sub(r'\(\s+', '(', text))
+
+
+def format_ipa(ipa) -> str:
+    """Return an IPA string, labelled with its dialect/qualifier if present.
+
+    Rhyme lines (which also use the IPA class) are skipped.
+    """
+    li = ipa.find_parent('li')
+    if li is not None:
+        if clean_text(li.get_text()).lower().startswith('rhymes'):
+            return ''
+        labels = []
+        for q in li.find_all('span', class_='ib-content'):
+            if q.find_parent('li') is li:
+                labels.append(clean_text(q.get_text()))
+        label = ', '.join(labels)
+        if label:
+            return f"{label}: {clean_text(ipa.get_text())}"
+    return clean_text(ipa.get_text())
+
+
+def parse_sense(li) -> Dict:
+    """Parse one definition <li>: its text, usage examples and sub-senses"""
+    own = copy.copy(li)
+    for nested in own.find_all(['ol', 'ul', 'dl']):
+        nested.decompose()
+    
+    examples = []
+    for div in li.select('div.h-usage-example'):
+        if div.find_parent('li') is not li:
+            continue  # belongs to a nested sub-sense
+        ex = div.find('i', class_='e-example')
+        if ex is None:
+            continue
+        text = clean_text(ex.get_text())
+        tr = div.find('span', class_='e-translation')
+        if tr is not None:
+            text += f" \u2014 {clean_text(tr.get_text())}"
+        if text and text not in examples:
+            examples.append(text)
+    
+    subsenses = []
+    for sub_ol in li.find_all('ol', recursive=False):
+        for sub_li in sub_ol.find_all('li', recursive=False):
+            sub = parse_sense(sub_li)
+            if sub['text']:
+                subsenses.append(sub)
+    
+    return {'text': clean_text(own.get_text()), 'examples': examples, 'subsenses': subsenses}
+
+
+def extract_term_links(elem) -> List[str]:
+    """Collect term names from the links in a nyms/derived/related section"""
+    terms = []
+    for link in elem.find_all('a', href=True):
+        if link.find_parent('span', class_='mw-editsection'):
+            continue
+        text = clean_text(link.get_text())
+        if text and not text.startswith('Thesaurus:') and text != 'edit':
+            terms.append(text)
+    return terms
+
+
 def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, Optional[str]]:
     """
     Parse the Wiktionary HTML and extract all content for the specified language.
@@ -390,7 +466,7 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
         'derived': [],
     }
     
-    current_section = None
+    current_section = ''
     current_pos = None
     
     log.debug(f"\nParsing content...")
@@ -413,101 +489,38 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
                         info['definitions'][current_pos] = []
         
         # Extract pronunciation
-        if current_section and 'pronunciation' in current_section:
-            # IPA notation
-            ipa_spans = elem.find_all('span', class_='IPA')
-            for ipa in ipa_spans:
-                ipa_text = ipa.get_text()
-                if ipa_text not in info['pronunciation']:
-                    info['pronunciation'].append(ipa_text)
+        if current_section == 'pronunciation' or current_section.startswith('pronunciation '):
+            for ipa in elem.find_all('span', class_='IPA'):
+                entry = format_ipa(ipa)
+                if entry and entry not in info['pronunciation']:
+                    info['pronunciation'].append(entry)
         
         # Extract etymology
-        if current_section and 'etymology' in current_section:
+        if current_section.startswith('etymology'):
             if elem.name == 'p':
-                text = elem.get_text().strip()
+                text = clean_text(re.sub(r'\[\d+\]', '', elem.get_text()))  # drop footnote markers
                 if text and text not in info['etymology']:
                     info['etymology'].append(text)
         
         # Extract definitions from ordered lists
         if elem.name == 'ol' and current_pos:
             for li in elem.find_all('li', recursive=False):
-                # Get the definition text - only direct children, not nested content
-                def_text = ''
-                
-                # Process only direct text and inline elements
-                for content in li.children:
-                    if isinstance(content, str):  # Direct text node
-                        def_text += content.strip() + ' '
-                    elif content.name in ['i', 'b', 'span', 'a']:
-                        def_text += content.get_text().strip() + ' '
-                    elif content.name == 'dl':
-                        # This is where examples start, stop here
-                        break
-                
-                def_text = def_text.strip()
-                
-                # Extract usage examples from the dl/dd structure
-                examples = []
-                for dl in li.find_all('dl', recursive=False):
-                    for dd in dl.find_all('dd', recursive=False):
-                        # Only get the first line of text (the example in original language)
-                        # Skip translations and other nested content
-                        example_parts = []
-                        for content in dd.children:
-                            if isinstance(content, str):
-                                text = content.strip()
-                                if text:
-                                    example_parts.append(text)
-                            elif content.name == 'i' and 'e-example' in content.get('class', []):
-                                text = content.get_text().strip()
-                                if text:
-                                    example_parts.append(text)
-                            elif content.name == 'dl':
-                                # Stop at nested dl (these are translations)
-                                break
-                        
-                        if example_parts:
-                            example = ' '.join(example_parts)
-                            if example and example not in examples:
-                                examples.append(example)
-                
-                if def_text:
-                    info['definitions'][current_pos].append({
-                        'text': def_text,
-                        'examples': examples
-                    })
+                sense = parse_sense(li)
+                if sense['text']:
+                    info['definitions'][current_pos].append(sense)
+                # Synonyms/antonyms are often listed inline under each sense
+                for key, css in (('synonyms', 'synonym'), ('antonyms', 'antonym')):
+                    for span in li.select(f'span.nyms.{css}'):
+                        for text in extract_term_links(span):
+                            if text not in info[key]:
+                                info[key].append(text)
         
-        # Extract synonyms
-        if current_section and 'synonym' in current_section:
-            links = elem.find_all('a', href=True)
-            for link in links:
-                text = link.get_text().strip()
-                if text and not text.startswith('Thesaurus:') and text not in info['synonyms']:
-                    info['synonyms'].append(text)
-        
-        # Extract antonyms
-        if current_section and 'antonym' in current_section:
-            links = elem.find_all('a', href=True)
-            for link in links:
-                text = link.get_text().strip()
-                if text and text not in info['antonyms']:
-                    info['antonyms'].append(text)
-        
-        # Extract derived terms
-        if current_section and 'derived' in current_section:
-            links = elem.find_all('a', href=True)
-            for link in links:
-                text = link.get_text().strip()
-                if text and text not in info['derived']:
-                    info['derived'].append(text)
-        
-        # Extract related terms
-        if current_section and 'related' in current_section:
-            links = elem.find_all('a', href=True)
-            for link in links:
-                text = link.get_text().strip()
-                if text and text not in info['related']:
-                    info['related'].append(text)
+        # Extract synonyms, antonyms, derived and related terms
+        for key, prefix in NYM_SECTIONS.items():
+            if current_section.startswith(prefix):
+                for text in extract_term_links(elem):
+                    if text not in info[key]:
+                        info[key].append(text)
     
     log.debug(f"\n=== PARSING SUMMARY ===")
     log.debug(f"Pronunciation entries: {len(info['pronunciation'])}")
@@ -572,9 +585,12 @@ def format_for_display(info: Dict) -> str:
             lines.append(f"\n  {pos}:")
             for i, defn in enumerate(defs, 1):
                 lines.append(f"    {i}. {defn['text']}")
-                if defn['examples']:
-                    for example in defn['examples']:
-                        lines.append(f"       • {example}")
+                for example in defn['examples']:
+                    lines.append(f"       • {example}")
+                for j, sub in enumerate(defn.get('subsenses', []), 1):
+                    lines.append(f"       {i}.{j}. {sub['text']}")
+                    for example in sub['examples']:
+                        lines.append(f"          • {example}")
         lines.append("")
     
     # Synonyms
@@ -613,6 +629,22 @@ def format_for_display(info: Dict) -> str:
     return "\n".join(lines)
 
 
+def sense_to_html(sense: Dict) -> str:
+    """Render one definition (with examples and sub-senses) as an HTML <li>"""
+    parts = [f"<li>{html_escape(sense['text'])}"]
+    if sense['examples']:
+        parts.append("<ul style='margin-top: 5px; margin-bottom: 5px;'>")
+        for example in sense['examples']:
+            parts.append(f"<li><em>{html_escape(example)}</em></li>")
+        parts.append("</ul>")
+    if sense.get('subsenses'):
+        parts.append("<ol type='a'>")
+        parts.extend(sense_to_html(sub) for sub in sense['subsenses'])
+        parts.append("</ol>")
+    parts.append("</li>")
+    return ''.join(parts)
+
+
 def format_for_anki(info: Dict) -> str:
     """Format the parsed information as HTML for the Anki card back"""
     # All scraped text is escaped: it ends up inside HTML in the Anki field
@@ -635,13 +667,7 @@ def format_for_anki(info: Dict) -> str:
             html_parts.append(f"<p><strong>{esc(pos)}:</strong></p>")
             html_parts.append("<ol>")
             for defn in defs:
-                html_parts.append(f"<li>{esc(defn['text'])}")
-                if defn['examples']:
-                    html_parts.append("<ul style='margin-top: 5px; margin-bottom: 5px;'>")
-                    for example in defn['examples']:
-                        html_parts.append(f"<li><em>{esc(example)}</em></li>")
-                    html_parts.append("</ul>")
-                html_parts.append("</li>")
+                html_parts.append(sense_to_html(defn))
             html_parts.append("</ol>")
 
     # Synonyms, antonyms, derived and related terms
