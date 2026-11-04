@@ -16,7 +16,9 @@ import os
 import argparse
 import requests
 import hashlib
+from html import escape as html_escape
 from pathlib import Path
+from urllib.parse import quote
 from bs4 import BeautifulSoup
 from typing import Optional, Dict, List, Tuple
 
@@ -186,7 +188,7 @@ def add_note_to_anki(note: Dict):
 
 def fetch_wiktionary_entry(word: str) -> str:
     """Fetch the HTML content from Wiktionary"""
-    url = f"https://en.wiktionary.org/wiki/{word}"
+    url = f"https://en.wiktionary.org/wiki/{quote(word.replace(' ', '_'), safe='')}"
     
     print(f"\n=== FETCHING FROM WIKTIONARY ===")
     print(f"URL: {url}")
@@ -595,65 +597,50 @@ def format_for_display(info: Dict) -> str:
 
 def format_for_anki(info: Dict) -> str:
     """Format the parsed information as HTML for the Anki card back"""
+    # All scraped text is escaped: it ends up inside HTML in the Anki field
+    esc = html_escape
     html_parts = []
-    
+
     # Pronunciation
     if info['pronunciation']:
-        pron = ', '.join(info['pronunciation'])
+        pron = ', '.join(esc(p) for p in info['pronunciation'])
         html_parts.append(f"<p><strong>Pronunciation:</strong> {pron}</p>")
-    
+
     # Etymology
     if info['etymology']:
-        etym = ' '.join(info['etymology'])
+        etym = esc(' '.join(info['etymology']))
         html_parts.append(f"<p><strong>Etymology:</strong> {etym}</p>")
-    
+
     # Definitions by part of speech
     if info['definitions']:
         for pos, defs in info['definitions'].items():
-            html_parts.append(f"<p><strong>{pos}:</strong></p>")
+            html_parts.append(f"<p><strong>{esc(pos)}:</strong></p>")
             html_parts.append("<ol>")
             for defn in defs:
-                html_parts.append(f"<li>{defn['text']}")
+                html_parts.append(f"<li>{esc(defn['text'])}")
                 if defn['examples']:
                     html_parts.append("<ul style='margin-top: 5px; margin-bottom: 5px;'>")
                     for example in defn['examples']:
-                        html_parts.append(f"<li><em>{example}</em></li>")
+                        html_parts.append(f"<li><em>{esc(example)}</em></li>")
                     html_parts.append("</ul>")
                 html_parts.append("</li>")
             html_parts.append("</ol>")
-    
-    # Synonyms
-    if info['synonyms']:
-        syn_text = ', '.join(info['synonyms'][:15])
-        html_parts.append(f"<p><strong>Synonyms:</strong> {syn_text}")
-        if len(info['synonyms']) > 15:
-            html_parts.append(f" <em>(+{len(info['synonyms']) - 15} more)</em>")
-        html_parts.append("</p>")
-    
-    # Antonyms
-    if info['antonyms']:
-        ant_text = ', '.join(info['antonyms'][:15])
-        html_parts.append(f"<p><strong>Antonyms:</strong> {ant_text}")
-        if len(info['antonyms']) > 15:
-            html_parts.append(f" <em>(+{len(info['antonyms']) - 15} more)</em>")
-        html_parts.append("</p>")
-    
-    # Derived terms
-    if info['derived']:
-        der_text = ', '.join(info['derived'][:10])
-        html_parts.append(f"<p><strong>Derived terms:</strong> {der_text}")
-        if len(info['derived']) > 10:
-            html_parts.append(f" <em>(+{len(info['derived']) - 10} more)</em>")
-        html_parts.append("</p>")
-    
-    # Related terms
-    if info['related']:
-        rel_text = ', '.join(info['related'][:10])
-        html_parts.append(f"<p><strong>Related terms:</strong> {rel_text}")
-        if len(info['related']) > 10:
-            html_parts.append(f" <em>(+{len(info['related']) - 10} more)</em>")
-        html_parts.append("</p>")
-    
+
+    # Synonyms, antonyms, derived and related terms
+    for label, key, limit in (
+        ("Synonyms", 'synonyms', 15),
+        ("Antonyms", 'antonyms', 15),
+        ("Derived terms", 'derived', 10),
+        ("Related terms", 'related', 10),
+    ):
+        items = info[key]
+        if items:
+            text = ', '.join(esc(i) for i in items[:limit])
+            html_parts.append(f"<p><strong>{label}:</strong> {text}")
+            if len(items) > limit:
+                html_parts.append(f" <em>(+{len(items) - limit} more)</em>")
+            html_parts.append("</p>")
+
     return '\n'.join(html_parts)
 
 
