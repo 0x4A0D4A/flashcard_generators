@@ -114,6 +114,11 @@ def check_anki_connection():
         sys.exit(1)
 
 
+def deck_exists(deck_name: str) -> bool:
+    """Check whether a deck already exists"""
+    return deck_name in invoke_anki("deckNames")
+
+
 def create_deck_if_needed(deck_name: str):
     """Create the deck if it doesn't exist"""
     invoke_anki("createDeck", deck=deck_name)
@@ -682,9 +687,6 @@ Examples:
     # Check AnkiConnect
     check_anki_connection()
     
-    # Create deck if needed
-    create_deck_if_needed(deck_name)
-    
     # Fetch and parse
     html = fetch_wiktionary_entry(word)
     info, audio_url = parse_wiktionary_entry(html, language, word)
@@ -696,10 +698,10 @@ Examples:
     # Format for Anki
     anki_details = format_for_anki(info)
     
-    # Check for duplicates
+    # Check for duplicates (a deck that doesn't exist yet can't contain any)
     print(f"\nChecking for duplicates in deck '{deck_name}'...")
     note = build_note(deck_name, word, anki_details, audio_url)
-    if not can_add_note(note):
+    if deck_exists(deck_name) and not can_add_note(note):
         print(f"Error: Card for '{word}' already exists in deck '{deck_name}'")
         sys.exit(1)
     
@@ -715,6 +717,7 @@ Examples:
     
     if response == 'y' or response == 'yes':
         print("\nAdding card to Anki...")
+        create_deck_if_needed(deck_name)
         note_id = add_note_to_anki(note)
         print(f"✓ Card added successfully! (Note ID: {note_id})")
     else:
