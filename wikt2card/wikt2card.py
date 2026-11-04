@@ -119,32 +119,12 @@ def create_deck_if_needed(deck_name: str):
     invoke_anki("createDeck", deck=deck_name)
 
 
-def can_add_note(deck_name: str, word: str, details: str) -> bool:
-    """Check if a note can be added (i.e., not a duplicate)"""
-    note = {
-        "deckName": deck_name,
-        "modelName": "Basic",
-        "fields": {
-            "Front": word,
-            "Back": details
-        }
-    }
-    
-    result = invoke_anki(
-        "canAddNotesWithErrorDetail",
-        notes=[note]
-    )
-    
-    # result is a list with one element per note
-    if result and len(result) > 0:
-        can_add = result[0].get("canAdd", False)
-        return can_add
-    
-    return False
+def build_note(deck_name: str, word: str, details: str, audio_url: Optional[str] = None) -> Dict:
+    """Build the AnkiConnect note payload.
 
-
-def add_note_to_anki(deck_name: str, word: str, details: str, audio_url: Optional[str] = None):
-    """Add a note to Anki"""
+    Used for both the duplicate check and the actual add, so that both use
+    the same duplicate scope (the target deck, excluding child decks).
+    """
     note = {
         "deckName": deck_name,
         "modelName": "Basic",
@@ -162,7 +142,7 @@ def add_note_to_anki(deck_name: str, word: str, details: str, audio_url: Optiona
         },
         "tags": ["wikt2card"]
     }
-    
+
     # Add audio if available
     if audio_url:
         note["audio"] = [{
@@ -170,7 +150,23 @@ def add_note_to_anki(deck_name: str, word: str, details: str, audio_url: Optiona
             "filename": f"{word}.mp3",
             "fields": ["Front"]
         }]
-    
+
+    return note
+
+
+def can_add_note(note: Dict) -> bool:
+    """Check if a note can be added (i.e., not a duplicate)"""
+    result = invoke_anki("canAddNotesWithErrorDetail", notes=[note])
+
+    # result is a list with one element per note
+    if result and len(result) > 0:
+        return result[0].get("canAdd", False)
+
+    return False
+
+
+def add_note_to_anki(note: Dict):
+    """Add a note to Anki"""
     try:
         result = invoke_anki("addNote", note=note)
         return result
@@ -702,7 +698,8 @@ Examples:
     
     # Check for duplicates
     print(f"\nChecking for duplicates in deck '{deck_name}'...")
-    if not can_add_note(deck_name, word, anki_details):
+    note = build_note(deck_name, word, anki_details, audio_url)
+    if not can_add_note(note):
         print(f"Error: Card for '{word}' already exists in deck '{deck_name}'")
         sys.exit(1)
     
@@ -718,7 +715,7 @@ Examples:
     
     if response == 'y' or response == 'yes':
         print("\nAdding card to Anki...")
-        note_id = add_note_to_anki(deck_name, word, anki_details, audio_url)
+        note_id = add_note_to_anki(note)
         print(f"✓ Card added successfully! (Note ID: {note_id})")
     else:
         print("Card not added.")
