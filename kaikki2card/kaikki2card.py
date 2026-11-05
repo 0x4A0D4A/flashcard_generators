@@ -417,6 +417,8 @@ def follow_stubs(conn: sqlite3.Connection, lang: str, entries: List[dict],
                 queue.extend((t, depth + 1) for t in targets)
                 continue
         result.append(entry)
+    if not result:  # stubs that only point at each other: show the originals
+        return entries, False
     return result, followed
 
 
