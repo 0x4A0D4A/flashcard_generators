@@ -17,6 +17,7 @@ Data lives in $XDG_DATA_HOME/kaikki (default ~/.local/share/kaikki).
 """
 
 import argparse
+import gzip
 import json
 import logging
 import os
@@ -110,6 +111,65 @@ def cmd_fetch(args) -> int:
 
 
 # ============================================================================
+# extract: one streaming pass over the raw dump, keeping a single language
+# ============================================================================
+
+try:
+    import orjson as _json_fast
+    _loads = _json_fast.loads
+except ImportError:  # stdlib fallback; slower but fine for the first pass
+    _loads = json.loads
+
+
+def subset_path(lang: str) -> Path:
+    return data_dir() / f"{lang}.jsonl.gz"
+
+
+def extract_language(lang: str, src: Path, dest: Path) -> Dict[str, float]:
+    """Copy the entries of one language from the raw dump into a small file.
+
+    Entries *about* other languages (e.g. English words that merely list an
+    Irish translation) contain the same ``"lang_code": "ga"`` text, so a cheap
+    substring test selects candidates and the parsed top-level ``lang_code``
+    decides. The raw file is streamed and never written out uncompressed.
+    """
+    needle = f'"lang_code": "{lang}"'.encode()
+    started = time.time()
+    scanned = candidates = kept = 0
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(src, "rb") as fin, gzip.open(tmp, "wb") as fout:
+        for line in fin:
+            scanned += 1
+            if needle not in line:
+                continue
+            candidates += 1
+            if _loads(line).get("lang_code") == lang:
+                fout.write(line)
+                kept += 1
+            if scanned % 1_000_000 == 0:
+                log.debug(f"scanned {scanned:,} lines, kept {kept:,}")
+    tmp.replace(dest)  # only a complete file ever has the final name
+    return {"scanned": scanned, "candidates": candidates, "kept": kept,
+            "seconds": time.time() - started}
+
+
+def cmd_extract(args) -> int:
+    """Write <lang>.jsonl.gz containing only that language's entries"""
+    src = raw_path()
+    if not src.exists():
+        print(f"Error: {src} not found; run `kaikki2card fetch` first")
+        return 1
+    dest = subset_path(args.lang)
+    stats = extract_language(args.lang, src, dest)
+    print(f"Scanned {stats['scanned']:,} lines in {stats['seconds']:.0f}s; "
+          f"kept {stats['kept']:,} '{args.lang}' entries "
+          f"({stats['candidates']:,} substring candidates) -> {dest} "
+          f"({dest.stat().st_size / 1e6:.1f} MB)")
+    return 0
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -120,6 +180,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest='command', required=True)
 
     sub.add_parser('fetch', help='Download the raw kaikki.org dump').set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser('extract', help='Copy one language out of the raw dump')
+    p.add_argument('--lang', required=True, help='Wiktionary language code (e.g. ga, fr, ja)')
+    p.set_defaults(func=cmd_extract)
     return parser
 
 
