@@ -49,3 +49,100 @@ Observed by reading the real raw file, not the deprecated per-language
   single-word forms are usable for token lookup.
 - A word can have several entries (`bean` is a noun and a pronoun; `bí` is a
   verb and a noun), so lookups return a list.
+
+## Usage
+
+```bash
+./kaikki2card.py fetch                     # 3.08 GB download, resumable, once
+./kaikki2card.py build --lang ga           # cut Irish out of the dump, load SQLite
+./kaikki2card.py lookup --lang ga bhean    # -> bean (lenited form of bean)
+./kaikki2card.py resolve --lang ga novel.txt           # coverage report
+./kaikki2card.py cards --lang ga novel.txt --out cards.tsv   # preview + TSV for Anki import
+./kaikki2card.py cards --lang ga novel.txt --anki --deck "Irish::Niamh"   # via AnkiConnect
+```
+
+`build` reuses the cached `<lang>.jsonl.gz`; add `--refresh` to re-cut it from
+a newer raw dump. `cards` skips proper nouns, the `--skip-top` most frequent
+lemmas (default 100, mostly function words) and any lemma listed in a
+`--known FILE`, and adds the first short sentence of the text that uses the
+word. `--anki` reuses `../wikt2card`'s AnkiConnect helpers (so it needs
+`pip install -r ../wikt2card/requirements.txt`) and skips cards already in the
+deck. Nothing is written to Anki without `--anki`.
+
+Tests are offline: `python3 -m pytest tests` (needs pytest and, for the Anki
+tests, `requests`/`beautifulsoup4`).
+
+## Measured results (Irish, this laptop, 2026-11-05)
+
+The research report estimated these; the right-hand column is what actually
+happened. Raw file: Wiktionary dump of 2026-10-01, extracted 2026-10-30.
+
+| Step | Report's estimate | Measured |
+| --- | --- | --- |
+| `fetch` (3,082,476,978 B) | n/a | ~7.6 min at ~6 MB/s; size matched exactly, `gzip -t` OK |
+| `extract --lang ga` (11.1M lines, 26.6 GB uncompressed) | 15-40 min | **102 s**, 93 s CPU; 38,988 entries (matches the research count), 9.2 MB |
+| `build --lang ga` | n/a | **3.5-4.6 s**; 183,324 forms |
+| Irish database | 50-60 MB | **28.8 MB** |
+| `resolve` a whole novel | seconds | **1.65 s** for 110,710 tokens / 7,038 distinct words |
+
+Peak disk is the 3.08 GB download plus ~40 MB of derived data; the 26.6 GB
+uncompressed file is never written out. No network access is needed after
+`fetch`.
+
+### Coverage on a real novel
+
+Text: *Niamh* (Peter O'Leary, Project Gutenberg #50913, boilerplate removed;
+early-20th-century Roman-script Irish).
+
+| resolved by | distinct words | tokens |
+| --- | --- | --- |
+| headword (`exact`, incl. via a form-of stub) | 33.5% | 77.8% |
+| mutation rules | 11.5% | 5.1% |
+| inflected-forms table | 11.6% | 5.5% |
+| **total resolved** | **56.6%** | **88.4%** |
+| unresolved | 43.4% | 11.6% |
+
+Note that "resolved" means *an entry was found*, not that it is the right
+word. A spot check of ~30 random resolutions found most correct (`mhór`->`mór`,
+`cia`->`cé`, `chonacadar`->`feic`, `marbhófá`->`maraigh`, `gcreideamh`->`creideamh`)
+but ~700 words have more than one candidate lemma and the tool just takes the
+first, so some picks are wrong or merely plausible (`bhean`->`bean`/`bain`,
+`h-iasachtaí`->`iasachtaí`).
+
+## Known gaps
+
+- **Old orthography and names dominate what is unresolved.** The most frequent
+  misses are names (Murchadh, Gormfhlaith, Sitric, Lochlanach), archaic
+  spellings (`árdrígh`, `beannuighthe`, `ímpídhe`, `n-oídhche`, `dúbhairt`,
+  `éirean` for `Éireann`) and clitic contractions (`arsa’n`, `do’n`, `a’s`).
+  A normaliser for pre-standard spelling and an apostrophe-clitic splitter
+  would be the next language rules; no Wiktionary data fixes these.
+- **No part-of-speech disambiguation.** The first candidate lemma wins. The
+  research recommends a tagger (Stanza, 95.3 lemma accuracy for Irish on
+  treebank text, lower on literary Irish) to choose between candidates;
+  it has not been tried.
+- **Irish has almost no audio or examples in Wiktionary**: audio on 10 entries,
+  about 2,300 real examples. Cards carry the in-text sentence instead; audio is not
+  downloaded.
+- Etymology and some `forms` still contain template residue after cleaning
+  (only the leading `X word\n form` header is stripped).
+- `--anki` is covered by tests against a fake AnkiConnect but has **not been run
+  against a real Anki** (Anki was not running when this was built).
+
+## Extending to French and Japanese
+
+`--lang fr` / `--lang ja` already work for `extract`, `build` and `lookup`: the
+core never mentions Irish. A language only needs an entry in `languages.py`
+(`LANGUAGES = {"ga": irish_candidates}`):
+
+- **French:** add a candidate function for elisions (`l'eau`, `qu'il`) and, in
+  practice, a lemmatizer, since Wiktionary's `forms` table covers inflections
+  but not homographs (`est`, `sont`).
+- **Japanese:** `languages.tokenize` splits on letters and cannot segment
+  Japanese; it needs a morphological analyser (e.g. SudachiPy or Stanza) behind
+  the same `tokenize`/`candidates` hooks.
+
+The database is one file for all languages (`lang` column), and `build --lang`
+replaces only that language's rows. French will be larger than Irish (the
+English-edition French file is ~5x Irish's size postprocessed: 566 MiB vs
+107 MiB, per the research report), but the same streaming pass applies.
