@@ -1,0 +1,2 @@
+# stdlib only; orjson is optional and makes `build` faster
+orjson>=3.9
