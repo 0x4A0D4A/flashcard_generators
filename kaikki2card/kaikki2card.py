@@ -170,6 +170,169 @@ def cmd_extract(args) -> int:
 
 
 # ============================================================================
+# build: load a language into SQLite
+# ============================================================================
+
+import sqlite3
+
+# Form markers that are template noise, not real inflected forms
+JUNK_FORM_TAGS = {"table-tags", "inflection-template", "error-unrecognized-form"}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS entries (
+    id    INTEGER PRIMARY KEY,
+    lang  TEXT NOT NULL,
+    word  TEXT NOT NULL,
+    pos   TEXT,
+    data  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS forms (
+    form     TEXT NOT NULL,
+    lang     TEXT NOT NULL,
+    entry_id INTEGER NOT NULL,
+    tags     TEXT
+);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def db_path() -> Path:
+    return data_dir() / "kaikki.sqlite"
+
+
+def _word_list(items) -> list:
+    """['word', ...] from kaikki's [{'word': ..., ...}, ...] lists"""
+    out = []
+    for item in items or []:
+        word = item.get("word") if isinstance(item, dict) else item
+        if word and word not in out:
+            out.append(word)
+    return out
+
+
+def compact_entry(entry: dict) -> dict:
+    """Reduce a raw entry to the fields cards need (drops templates etc.)"""
+    senses = []
+    synonyms = _word_list(entry.get("synonyms"))
+    antonyms = _word_list(entry.get("antonyms"))
+    for sense in entry.get("senses", []):
+        glosses = sense.get("glosses") or []
+        if not glosses:
+            continue
+        examples = []
+        for ex in sense.get("examples", []):
+            if ex.get("type") == "quotation" or not ex.get("text"):
+                continue  # citations with references are not card material
+            examples.append({
+                "text": ex["text"],
+                "translation": ex.get("english") or ex.get("translation") or "",
+            })
+        senses.append({
+            "glosses": glosses,
+            "tags": [t for t in sense.get("tags", []) if t not in ("form-of", "alt-of")],
+            "examples": examples,
+            "form_of": _word_list(sense.get("form_of")),
+            "alt_of": _word_list(sense.get("alt_of")),
+        })
+        for word in _word_list(sense.get("synonyms")):
+            if word not in synonyms:
+                synonyms.append(word)
+        for word in _word_list(sense.get("antonyms")):
+            if word not in antonyms:
+                antonyms.append(word)
+
+    sounds = []
+    for sound in entry.get("sounds", []):
+        keep = {k: sound[k] for k in ("ipa", "tags", "audio", "ogg_url", "mp3_url") if sound.get(k)}
+        if "ipa" in keep or "audio" in keep:
+            sounds.append(keep)
+
+    return {
+        "senses": senses,
+        "sounds": sounds,
+        "etymology": (entry.get("etymology_text") or "").strip(),
+        "synonyms": synonyms,
+        "antonyms": antonyms,
+        "derived": _word_list(entry.get("derived")),
+        "related": _word_list(entry.get("related")),
+    }
+
+
+def usable_forms(entry: dict) -> list:
+    """(form, tags) pairs worth indexing: single words, no template junk"""
+    out = []
+    seen = set()
+    for f in entry.get("forms", []):
+        form = (f.get("form") or "").strip()
+        tags = f.get("tags") or []
+        if not form or " " in form or form == entry["word"]:
+            continue
+        if JUNK_FORM_TAGS & set(tags):
+            continue
+        key = (form, " ".join(tags))
+        if key not in seen:
+            seen.add(key)
+            out.append((form, " ".join(tags)))
+    return out
+
+
+def load_language(conn: sqlite3.Connection, lang: str, lines) -> Dict[str, int]:
+    """Replace everything stored for `lang` with the entries in `lines`"""
+    conn.executescript(SCHEMA)
+    conn.execute("DELETE FROM forms WHERE lang = ?", (lang,))
+    conn.execute("DELETE FROM entries WHERE lang = ?", (lang,))
+    entries = forms = 0
+    for line in lines:
+        raw = _loads(line)
+        if raw.get("lang_code") != lang:
+            continue
+        cur = conn.execute(
+            "INSERT INTO entries (lang, word, pos, data) VALUES (?, ?, ?, ?)",
+            (lang, raw["word"], raw.get("pos"),
+             json.dumps(compact_entry(raw), ensure_ascii=False, separators=(",", ":"))),
+        )
+        entries += 1
+        rows = [(form, lang, cur.lastrowid, tags) for form, tags in usable_forms(raw)]
+        conn.executemany("INSERT INTO forms VALUES (?, ?, ?, ?)", rows)
+        forms += len(rows)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_word ON entries (lang, word)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_forms_form ON forms (lang, form)")
+    return {"entries": entries, "forms": forms}
+
+
+def cmd_build(args) -> int:
+    """Build/refresh the database for one language"""
+    started = time.time()
+    sub = subset_path(args.lang)
+    if args.refresh or not sub.exists():
+        rc = cmd_extract(args)
+        if rc:
+            return rc
+    conn = sqlite3.connect(db_path())
+    try:
+        with gzip.open(sub, "rb") as fin:
+            counts = load_language(conn, args.lang, fin)
+        meta = {}
+        if meta_path().exists():
+            meta = json.loads(meta_path().read_text())
+        for key, value in (
+            (f"{args.lang}:built_at", time.strftime("%Y-%m-%dT%H:%M:%S%z")),
+            (f"{args.lang}:source_last_modified", str(meta.get("last_modified"))),
+            (f"{args.lang}:source_size", str(meta.get("size"))),
+            (f"{args.lang}:entries", str(counts["entries"])),
+        ):
+            conn.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
+        conn.commit()
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+    print(f"Built '{args.lang}': {counts['entries']:,} entries, {counts['forms']:,} forms "
+          f"in {time.time() - started:.1f}s -> {db_path()} "
+          f"({db_path().stat().st_size / 1e6:.1f} MB)")
+    return 0
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -184,6 +347,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser('extract', help='Copy one language out of the raw dump')
     p.add_argument('--lang', required=True, help='Wiktionary language code (e.g. ga, fr, ja)')
     p.set_defaults(func=cmd_extract)
+
+    p = sub.add_parser('build', help='Load one language into the SQLite database')
+    p.add_argument('--lang', required=True, help='Wiktionary language code (e.g. ga, fr, ja)')
+    p.add_argument('--refresh', action='store_true',
+                   help='Re-extract the language from the raw dump first')
+    p.set_defaults(func=cmd_build)
     return parser
 
 
