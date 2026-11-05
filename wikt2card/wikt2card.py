@@ -3,7 +3,7 @@
 wikt2card - Fetch Wiktionary entries and add them directly to Anki
 
 Usage:
-    wikt2card <language> <word> [--deck DECK_NAME]
+    wikt2card <language> <word> [--deck DECK_NAME] [--note-type NAME] [-y] [-v]
 
 Examples:
     wikt2card french eau
@@ -12,13 +12,18 @@ Examples:
 
 import sys
 import json
-import os
+import re
 import argparse
+import copy
+import logging
 import requests
-import hashlib
+from html import escape as html_escape
 from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
 from bs4 import BeautifulSoup
 from typing import Optional, Dict, List, Tuple
+
+log = logging.getLogger('wikt2card')
 
 
 # ============================================================================
@@ -42,12 +47,6 @@ def load_config() -> Dict:
         return {"defaults": {}}
 
 
-def save_config(config: Dict):
-    """Save configuration to ~/.config/wikt2card/config.json"""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
-
 
 def get_deck_name(language: str, deck_override: Optional[str] = None) -> str:
     """Get the deck name for a language, respecting config and overrides"""
@@ -59,7 +58,7 @@ def get_deck_name(language: str, deck_override: Optional[str] = None) -> str:
         return config["defaults"][language.lower()]
     
     # Default: "wikt2card <Language>" with capitalized language
-    return f"Languages::{language.capitalize()}::Mining"
+    return f"wikt2card {language_title(language)}"
 
 
 # ============================================================================
@@ -67,6 +66,17 @@ def get_deck_name(language: str, deck_override: Optional[str] = None) -> str:
 # ============================================================================
 
 ANKI_CONNECT_URL = "http://localhost:8765"
+REQUEST_TIMEOUT = 30  # seconds
+DEFAULT_NOTE_TYPE = "Basic"  # must have "Front" and "Back" fields
+
+SESSION = requests.Session()
+SESSION.headers["User-Agent"] = (
+    "wikt2card/1.0 (https://github.com/0x4A0D4A/flashcard_generators)"
+)
+
+
+class AnkiError(Exception):
+    """Raised when AnkiConnect cannot be reached or reports an error"""
 
 
 def invoke_anki(action: str, **params) -> Dict:
@@ -76,42 +86,41 @@ def invoke_anki(action: str, **params) -> Dict:
         "version": 6,
         "params": params
     }
-    
+
     try:
-        response = requests.post(ANKI_CONNECT_URL, json=payload)
+        response = SESSION.post(ANKI_CONNECT_URL, json=payload, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         result = response.json()
-        
-        if len(result) != 2:
-            raise Exception("Response has unexpected number of fields")
-        if "error" not in result:
-            raise Exception("Response is missing required error field")
-        if "result" not in result:
-            raise Exception("Response is missing required result field")
-        if result["error"] is not None:
-            raise Exception(result["error"])
-        
-        return result["result"]
     except requests.exceptions.ConnectionError:
-        print("Error: Could not connect to AnkiConnect. Is Anki running?")
-        print("Make sure the AnkiConnect add-on is installed.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error communicating with Anki: {e}")
-        sys.exit(1)
+        raise AnkiError(
+            "Could not connect to AnkiConnect. Is Anki running, and is the "
+            "AnkiConnect add-on installed?"
+        )
+    except (requests.exceptions.RequestException, ValueError) as e:
+        raise AnkiError(f"Error communicating with Anki: {e}")
+
+    if len(result) != 2:
+        raise AnkiError("AnkiConnect response has unexpected number of fields")
+    if "error" not in result:
+        raise AnkiError("AnkiConnect response is missing required error field")
+    if "result" not in result:
+        raise AnkiError("AnkiConnect response is missing required result field")
+    if result["error"] is not None:
+        raise AnkiError(result["error"])
+
+    return result["result"]
 
 
 def check_anki_connection():
     """Verify that AnkiConnect is available"""
-    try:
-        version = invoke_anki("version")
-        if version < 6:
-            print(f"Warning: AnkiConnect version {version} may not be supported")
-    except SystemExit:
-        raise
-    except Exception as e:
-        print(f"Error: Could not verify AnkiConnect: {e}")
-        sys.exit(1)
+    version = invoke_anki("version")
+    if version < 6:
+        print(f"Warning: AnkiConnect version {version} may not be supported")
+
+
+def deck_exists(deck_name: str) -> bool:
+    """Check whether a deck already exists"""
+    return deck_name in invoke_anki("deckNames")
 
 
 def create_deck_if_needed(deck_name: str):
@@ -119,35 +128,27 @@ def create_deck_if_needed(deck_name: str):
     invoke_anki("createDeck", deck=deck_name)
 
 
-def can_add_note(deck_name: str, word: str, details: str) -> bool:
-    """Check if a note can be added (i.e., not a duplicate)"""
-    note = {
-        "deckName": deck_name,
-        "modelName": "Basic",
-        "fields": {
-            "Front": word,
-            "Back": details
-        }
-    }
-    
-    result = invoke_anki(
-        "canAddNotesWithErrorDetail",
-        notes=[note]
-    )
-    
-    # result is a list with one element per note
-    if result and len(result) > 0:
-        can_add = result[0].get("canAdd", False)
-        return can_add
-    
-    return False
+def audio_filename(audio_url: str) -> str:
+    """Derive a safe, collision-resistant media filename from an audio URL.
+
+    Wikimedia file names already encode the language and word (e.g.
+    Fr-eau.ogg.mp3), and keeping them preserves the real extension.
+    """
+    base = unquote(urlparse(audio_url).path.rsplit('/', 1)[-1])
+    base = re.sub(r'[^\w.\-]', '_', base) or 'audio'
+    return f"wikt2card_{base}"
 
 
-def add_note_to_anki(deck_name: str, word: str, details: str, audio_url: Optional[str] = None):
-    """Add a note to Anki"""
+def build_note(deck_name: str, word: str, details: str, audio_url: Optional[str] = None,
+               language: str = '', note_type: str = DEFAULT_NOTE_TYPE) -> Dict:
+    """Build the AnkiConnect note payload.
+
+    Used for both the duplicate check and the actual add, so that both use
+    the same duplicate scope (the target deck, excluding child decks).
+    """
     note = {
         "deckName": deck_name,
-        "modelName": "Basic",
+        "modelName": note_type,
         "fields": {
             "Front": word,
             "Back": details
@@ -160,56 +161,79 @@ def add_note_to_anki(deck_name: str, word: str, details: str, audio_url: Optiona
                 "checkChildren": False
             }
         },
-        "tags": ["wikt2card"]
+        "tags": ["wikt2card"] + (
+            [f"wikt2card::{language.replace(' ', '_').lower()}"] if language else []
+        )
     }
-    
+
     # Add audio if available
     if audio_url:
         note["audio"] = [{
             "url": audio_url,
-            "filename": f"{word}.mp3",
+            "filename": audio_filename(audio_url),
             "fields": ["Front"]
         }]
-    
-    try:
-        result = invoke_anki("addNote", note=note)
-        return result
-    except Exception as e:
-        print(f"Error adding note: {e}")
-        sys.exit(1)
+
+    return note
+
+
+def can_add_note(note: Dict) -> bool:
+    """Check if a note can be added (i.e., not a duplicate)"""
+    result = invoke_anki("canAddNotesWithErrorDetail", notes=[note])
+
+    # result is a list with one element per note
+    if result and len(result) > 0:
+        return result[0].get("canAdd", False)
+
+    return False
+
+
+def add_note_to_anki(note: Dict):
+    """Add a note to Anki"""
+    return invoke_anki("addNote", note=note)
 
 
 # ============================================================================
 # Wiktionary Fetching and Parsing
 # ============================================================================
 
+class WiktError(Exception):
+    """Raised when a Wiktionary entry cannot be fetched or parsed"""
+
+
+def language_title(language: str) -> str:
+    """Title-case every word of a language name ('old irish' -> 'Old Irish')"""
+    return ' '.join(part.capitalize() for part in language.split())
+
+
+def language_heading_id(language: str) -> str:
+    """The h2 id Wiktionary uses for a language ('old irish' -> 'Old_Irish')"""
+    return language_title(language).replace(' ', '_')
+
+
 def fetch_wiktionary_entry(word: str) -> str:
     """Fetch the HTML content from Wiktionary"""
-    url = f"https://en.wiktionary.org/wiki/{word}"
+    url = f"https://en.wiktionary.org/wiki/{quote(word.replace(' ', '_'), safe='')}"
     
-    print(f"\n=== FETCHING FROM WIKTIONARY ===")
-    print(f"URL: {url}")
+    log.debug(f"\n=== FETCHING FROM WIKTIONARY ===")
+    log.debug(f"URL: {url}")
     
     try:
-        response = requests.get(
-            url,
-            headers={'User-Agent': 'wikt2card/1.0 (https://github.com/user/wikt2card)'}
-        )
+        response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         
-        print(f"Status: {response.status_code}")
-        print(f"Content length: {len(response.text)} bytes")
-        print(f"Content type: {response.headers.get('content-type', 'unknown')}")
+        log.debug(f"Status: {response.status_code}")
+        log.debug(f"Content length: {len(response.text)} bytes")
+        log.debug(f"Content type: {response.headers.get('content-type', 'unknown')}")
         
         return response.text
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching Wiktionary entry: {e}")
-        sys.exit(1)
+        raise WiktError(f"Error fetching Wiktionary entry: {e}")
 
 
 def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
     """Extract the audio file URL from the pronunciation section"""
-    print(f"\n=== EXTRACTING AUDIO ===")
+    log.debug(f"\n=== EXTRACTING AUDIO ===")
     
     # The language_section is the h2 tag, we need to start from its parent div
     if language_section.parent and language_section.parent.name == 'div' and \
@@ -236,10 +260,10 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
         
         if heading_elem:
             heading_text = heading_elem.get_text().strip()
-            print(f"Checking section: {heading_text}")
+            log.debug(f"Checking section: {heading_text}")
             
             if 'pronunciation' in heading_text.lower():
-                print(f"Found pronunciation section!")
+                log.debug(f"Found pronunciation section!")
                 # Found pronunciation section, look for audio in subsequent siblings
                 audio_section = current.find_next_sibling()
                 while audio_section:
@@ -248,14 +272,14 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
                         break
                     
                     # Look for audio elements
-                    print(f"  Searching in: {audio_section.name}")
+                    log.debug(f"  Searching in: {audio_section.name}")
                     audio_elements = audio_section.find_all('audio')
                     for audio in audio_elements:
-                        print(f"    Found audio tag: {audio}")
+                        log.debug(f"    Found audio tag: {audio}")
                         sources = audio.find_all('source')
                         for source in sources:
                             src = source.get('src')
-                            print(f"      Source: {src}")
+                            log.debug(f"      Source: {src}")
                             if src:
                                 # Prefer mp3, then ogg
                                 if '.mp3' in src or '.ogg' in src:
@@ -265,7 +289,7 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
                                         url = 'https://en.wiktionary.org' + src
                                     else:
                                         url = src
-                                    print(f"      -> Using: {url}")
+                                    log.debug(f"      -> Using: {url}")
                                     return url
                     
                     audio_section = audio_section.find_next_sibling()
@@ -273,8 +297,83 @@ def extract_audio_url(soup: BeautifulSoup, language_section) -> Optional[str]:
         
         current = current.find_next_sibling()
     
-    print(f"No audio found")
+    log.debug(f"No audio found")
     return None
+
+
+NYM_SECTIONS = {
+    'synonyms': 'synonyms',
+    'antonyms': 'antonyms',
+    'derived': 'derived terms',
+    'related': 'related terms',
+}
+
+
+def clean_text(text: str) -> str:
+    """Collapse whitespace, including the stray spaces left around inline markup"""
+    text = ' '.join(text.split())
+    return re.sub(r'\s+([,.;:!?)])', r'\1', re.sub(r'\(\s+', '(', text))
+
+
+def format_ipa(ipa) -> str:
+    """Return an IPA string, labelled with its dialect/qualifier if present.
+
+    Rhyme lines (which also use the IPA class) are skipped.
+    """
+    li = ipa.find_parent('li')
+    if li is not None:
+        if clean_text(li.get_text()).lower().startswith('rhymes'):
+            return ''
+        labels = []
+        for q in li.find_all('span', class_='ib-content'):
+            if q.find_parent('li') is li:
+                labels.append(clean_text(q.get_text()))
+        label = ', '.join(labels)
+        if label:
+            return f"{label}: {clean_text(ipa.get_text())}"
+    return clean_text(ipa.get_text())
+
+
+def parse_sense(li) -> Dict:
+    """Parse one definition <li>: its text, usage examples and sub-senses"""
+    own = copy.copy(li)
+    for nested in own.find_all(['ol', 'ul', 'dl']):
+        nested.decompose()
+    
+    examples = []
+    for div in li.select('div.h-usage-example'):
+        if div.find_parent('li') is not li:
+            continue  # belongs to a nested sub-sense
+        ex = div.find('i', class_='e-example')
+        if ex is None:
+            continue
+        text = clean_text(ex.get_text())
+        tr = div.find('span', class_='e-translation')
+        if tr is not None:
+            text += f" \u2014 {clean_text(tr.get_text())}"
+        if text and text not in examples:
+            examples.append(text)
+    
+    subsenses = []
+    for sub_ol in li.find_all('ol', recursive=False):
+        for sub_li in sub_ol.find_all('li', recursive=False):
+            sub = parse_sense(sub_li)
+            if sub['text']:
+                subsenses.append(sub)
+    
+    return {'text': clean_text(own.get_text()), 'examples': examples, 'subsenses': subsenses}
+
+
+def extract_term_links(elem) -> List[str]:
+    """Collect term names from the links in a nyms/derived/related section"""
+    terms = []
+    for link in elem.find_all('a', href=True):
+        if link.find_parent('span', class_='mw-editsection'):
+            continue
+        text = clean_text(link.get_text())
+        if text and not text.startswith('Thesaurus:') and text != 'edit':
+            terms.append(text)
+    return terms
 
 
 def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, Optional[str]]:
@@ -284,76 +383,79 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
     """
     soup = BeautifulSoup(html, 'html.parser')
     
-    print(f"\n=== PARSING WIKTIONARY ENTRY ===")
-    print(f"Word: {word}")
-    print(f"Language: {language}")
+    log.debug(f"\n=== PARSING WIKTIONARY ENTRY ===")
+    log.debug(f"Word: {word}")
+    log.debug(f"Language: {language}")
     
     # Find all h2 headings
     all_h2s = soup.find_all('h2')
-    print(f"\nFound {len(all_h2s)} h2 headings:")
+    log.debug(f"\nFound {len(all_h2s)} h2 headings:")
     for i, h2 in enumerate(all_h2s[:10]):  # Show first 10
         h2_id = h2.get('id', 'no-id')
         h2_text = h2.get_text().strip()
-        print(f"  {i+1}. id='{h2_id}' text='{h2_text}'")
+        log.debug(f"  {i+1}. id='{h2_id}' text='{h2_text}'")
     
     # Find the language heading by ID attribute
-    language_heading = soup.find('h2', id=language.capitalize())
-    
+    heading_id = language_heading_id(language)
+    language_heading = soup.find('h2', id=heading_id)
+
     if not language_heading:
         # Fallback: try finding by text content
-        print(f"\nCouldn't find h2 with id='{language.capitalize()}', trying text match...")
+        log.debug(f"\nCouldn't find h2 with id='{heading_id}', trying text match...")
         for h2 in all_h2s:
             if h2.get_text().strip().lower() == language.lower():
                 language_heading = h2
-                print(f"Found by text: {h2}")
+                log.debug(f"Found by text: {h2}")
                 break
     
     if not language_heading:
-        print(f"\nERROR: Could not find {language.capitalize()} section")
-        print(f"Available language sections: {[h2.get('id') for h2 in all_h2s if h2.get('id')]}")
-        print(f"Check https://en.wiktionary.org/wiki/{word}")
-        sys.exit(1)
+        available = [h2.get('id') for h2 in all_h2s if h2.get('id')]
+        raise WiktError(
+            f"Could not find a {language_title(language)} section for '{word}'. "
+            f"Available language sections: {available}. "
+            f"Check https://en.wiktionary.org/wiki/{quote(word.replace(' ', '_'), safe='')}"
+        )
     
-    print(f"\nFound language section: {language_heading}")
+    log.debug(f"\nFound language section: {language_heading}")
     
     # Extract audio URL
     audio_url = extract_audio_url(soup, language_heading)
-    print(f"Audio URL: {audio_url}")
+    log.debug(f"Audio URL: {audio_url}")
     
     # The h2 might be wrapped in a div.mw-heading, so start from the right place
     if language_heading.parent and language_heading.parent.name == 'div' and \
        'mw-heading' in language_heading.parent.get('class', []):
         # Start from the wrapper div's next sibling
         start_element = language_heading.parent
-        print(f"H2 is wrapped in div.mw-heading, starting from: {start_element.name}")
+        log.debug(f"H2 is wrapped in div.mw-heading, starting from: {start_element.name}")
     else:
         # Start from the h2 itself
         start_element = language_heading
-        print(f"H2 is not wrapped, starting from: {start_element.name}")
+        log.debug(f"H2 is not wrapped, starting from: {start_element.name}")
     
     # Find all sibling elements until next h2
     content_elements = []
     current = start_element.find_next_sibling()
     
-    print(f"\nCollecting content elements...")
+    log.debug(f"\nCollecting content elements...")
     while current:
         # Stop if we hit another language section (h2 or div containing h2)
         if current.name == 'h2':
-            print(f"Stopped at next h2: {current.get('id')}")
+            log.debug(f"Stopped at next h2: {current.get('id')}")
             break
         if current.name == 'div' and 'mw-heading' in current.get('class', []):
             if current.find('h2'):
-                print(f"Stopped at div containing h2: {current.find('h2').get('id')}")
+                log.debug(f"Stopped at div containing h2: {current.find('h2').get('id')}")
                 break
         
         content_elements.append(current)
         if current.name == 'div' and 'mw-heading' in current.get('class', []):
             inner = current.find(['h3', 'h4'])
             if inner:
-                print(f"  Found section: {inner.get_text().strip()}")
+                log.debug(f"  Found section: {inner.get_text().strip()}")
         current = current.find_next_sibling()
     
-    print(f"Collected {len(content_elements)} elements")
+    log.debug(f"Collected {len(content_elements)} elements")
     
     # Extract structured information
     info = {
@@ -366,13 +468,12 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
         'antonyms': [],
         'related': [],
         'derived': [],
-        'raw_sections': []
     }
     
-    current_section = None
+    current_section = ''
     current_pos = None
     
-    print(f"\nParsing content...")
+    log.debug(f"\nParsing content...")
     for i, elem in enumerate(content_elements):
         # Check if this is a section heading (wrapped in div.mw-heading)
         if elem.name == 'div' and 'mw-heading' in elem.get('class', []):
@@ -380,7 +481,7 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
             if heading:
                 section_title = heading.get_text().strip()
                 current_section = section_title.lower()
-                print(f"  Section {i}: {section_title}")
+                log.debug(f"  Section {i}: {section_title}")
                 
                 # Check if this is a part of speech heading
                 pos_keywords = ['noun', 'verb', 'adjective', 'adverb', 'pronoun', 
@@ -392,117 +493,54 @@ def parse_wiktionary_entry(html: str, language: str, word: str) -> Tuple[Dict, O
                         info['definitions'][current_pos] = []
         
         # Extract pronunciation
-        if current_section and 'pronunciation' in current_section:
-            # IPA notation
-            ipa_spans = elem.find_all('span', class_='IPA')
-            for ipa in ipa_spans:
-                ipa_text = ipa.get_text()
-                if ipa_text not in info['pronunciation']:
-                    info['pronunciation'].append(ipa_text)
+        if current_section == 'pronunciation' or current_section.startswith('pronunciation '):
+            for ipa in elem.find_all('span', class_='IPA'):
+                entry = format_ipa(ipa)
+                if entry and entry not in info['pronunciation']:
+                    info['pronunciation'].append(entry)
         
         # Extract etymology
-        if current_section and 'etymology' in current_section:
+        if current_section.startswith('etymology'):
             if elem.name == 'p':
-                text = elem.get_text().strip()
+                text = clean_text(re.sub(r'\[\d+\]', '', elem.get_text()))  # drop footnote markers
                 if text and text not in info['etymology']:
                     info['etymology'].append(text)
         
         # Extract definitions from ordered lists
         if elem.name == 'ol' and current_pos:
             for li in elem.find_all('li', recursive=False):
-                # Get the definition text - only direct children, not nested content
-                def_text = ''
-                
-                # Process only direct text and inline elements
-                for content in li.children:
-                    if isinstance(content, str):  # Direct text node
-                        def_text += content.strip() + ' '
-                    elif content.name in ['i', 'b', 'span', 'a']:
-                        def_text += content.get_text().strip() + ' '
-                    elif content.name == 'dl':
-                        # This is where examples start, stop here
-                        break
-                
-                def_text = def_text.strip()
-                
-                # Extract usage examples from the dl/dd structure
-                examples = []
-                for dl in li.find_all('dl', recursive=False):
-                    for dd in dl.find_all('dd', recursive=False):
-                        # Only get the first line of text (the example in original language)
-                        # Skip translations and other nested content
-                        example_parts = []
-                        for content in dd.children:
-                            if isinstance(content, str):
-                                text = content.strip()
-                                if text:
-                                    example_parts.append(text)
-                            elif content.name == 'i' and 'e-example' in content.get('class', []):
-                                text = content.get_text().strip()
-                                if text:
-                                    example_parts.append(text)
-                            elif content.name == 'dl':
-                                # Stop at nested dl (these are translations)
-                                break
-                        
-                        if example_parts:
-                            example = ' '.join(example_parts)
-                            if example and example not in examples:
-                                examples.append(example)
-                
-                if def_text:
-                    info['definitions'][current_pos].append({
-                        'text': def_text,
-                        'examples': examples
-                    })
+                sense = parse_sense(li)
+                if sense['text']:
+                    info['definitions'][current_pos].append(sense)
+                # Synonyms/antonyms are often listed inline under each sense
+                for key, css in (('synonyms', 'synonym'), ('antonyms', 'antonym')):
+                    for span in li.select(f'span.nyms.{css}'):
+                        for text in extract_term_links(span):
+                            if text not in info[key]:
+                                info[key].append(text)
         
-        # Extract synonyms
-        if current_section and 'synonym' in current_section:
-            links = elem.find_all('a', href=True)
-            for link in links:
-                text = link.get_text().strip()
-                if text and not text.startswith('Thesaurus:') and text not in info['synonyms']:
-                    info['synonyms'].append(text)
-        
-        # Extract antonyms
-        if current_section and 'antonym' in current_section:
-            links = elem.find_all('a', href=True)
-            for link in links:
-                text = link.get_text().strip()
-                if text and text not in info['antonyms']:
-                    info['antonyms'].append(text)
-        
-        # Extract derived terms
-        if current_section and 'derived' in current_section:
-            links = elem.find_all('a', href=True)
-            for link in links:
-                text = link.get_text().strip()
-                if text and text not in info['derived']:
-                    info['derived'].append(text)
-        
-        # Extract related terms
-        if current_section and 'related' in current_section:
-            links = elem.find_all('a', href=True)
-            for link in links:
-                text = link.get_text().strip()
-                if text and text not in info['related']:
-                    info['related'].append(text)
+        # Extract synonyms, antonyms, derived and related terms
+        for key, prefix in NYM_SECTIONS.items():
+            if current_section.startswith(prefix):
+                for text in extract_term_links(elem):
+                    if text not in info[key]:
+                        info[key].append(text)
     
-    print(f"\n=== PARSING SUMMARY ===")
-    print(f"Pronunciation entries: {len(info['pronunciation'])}")
-    print(f"Etymology entries: {len(info['etymology'])}")
-    print(f"Definitions by POS:")
+    log.debug(f"\n=== PARSING SUMMARY ===")
+    log.debug(f"Pronunciation entries: {len(info['pronunciation'])}")
+    log.debug(f"Etymology entries: {len(info['etymology'])}")
+    log.debug(f"Definitions by POS:")
     for pos, defs in info['definitions'].items():
-        print(f"  {pos}: {len(defs)} definition(s)")
+        log.debug(f"  {pos}: {len(defs)} definition(s)")
         for j, d in enumerate(defs[:2]):  # Show first 2
             if isinstance(d, dict):
-                print(f"    {j+1}. {d['text'][:60]}...")
+                log.debug(f"    {j+1}. {d['text'][:60]}...")
             else:
-                print(f"    {j+1}. {d[:60]}...")
-    print(f"Synonyms: {len(info['synonyms'])}")
-    print(f"Antonyms: {len(info['antonyms'])}")
-    print(f"Derived terms: {len(info['derived'])}")
-    print(f"Related terms: {len(info['related'])}")
+                log.debug(f"    {j+1}. {d[:60]}...")
+    log.debug(f"Synonyms: {len(info['synonyms'])}")
+    log.debug(f"Antonyms: {len(info['antonyms'])}")
+    log.debug(f"Derived terms: {len(info['derived'])}")
+    log.debug(f"Related terms: {len(info['related'])}")
     
     return info, audio_url
 
@@ -516,7 +554,7 @@ def format_for_display(info: Dict) -> str:
     lines = []
     lines.append("=" * 70)
     lines.append(f"WORD: {info['word']}")
-    lines.append(f"LANGUAGE: {info['language'].capitalize()}")
+    lines.append(f"LANGUAGE: {language_title(info['language'])}")
     lines.append("=" * 70)
     lines.append("")
     
@@ -551,9 +589,12 @@ def format_for_display(info: Dict) -> str:
             lines.append(f"\n  {pos}:")
             for i, defn in enumerate(defs, 1):
                 lines.append(f"    {i}. {defn['text']}")
-                if defn['examples']:
-                    for example in defn['examples']:
-                        lines.append(f"       • {example}")
+                for example in defn['examples']:
+                    lines.append(f"       • {example}")
+                for j, sub in enumerate(defn.get('subsenses', []), 1):
+                    lines.append(f"       {i}.{j}. {sub['text']}")
+                    for example in sub['examples']:
+                        lines.append(f"          • {example}")
         lines.append("")
     
     # Synonyms
@@ -592,67 +633,62 @@ def format_for_display(info: Dict) -> str:
     return "\n".join(lines)
 
 
+def sense_to_html(sense: Dict) -> str:
+    """Render one definition (with examples and sub-senses) as an HTML <li>"""
+    parts = [f"<li>{html_escape(sense['text'])}"]
+    if sense['examples']:
+        parts.append("<ul style='margin-top: 5px; margin-bottom: 5px;'>")
+        for example in sense['examples']:
+            parts.append(f"<li><em>{html_escape(example)}</em></li>")
+        parts.append("</ul>")
+    if sense.get('subsenses'):
+        parts.append("<ol type='a'>")
+        parts.extend(sense_to_html(sub) for sub in sense['subsenses'])
+        parts.append("</ol>")
+    parts.append("</li>")
+    return ''.join(parts)
+
+
 def format_for_anki(info: Dict) -> str:
     """Format the parsed information as HTML for the Anki card back"""
+    # All scraped text is escaped: it ends up inside HTML in the Anki field
+    esc = html_escape
     html_parts = []
-    
+
     # Pronunciation
     if info['pronunciation']:
-        pron = ', '.join(info['pronunciation'])
+        pron = ', '.join(esc(p) for p in info['pronunciation'])
         html_parts.append(f"<p><strong>Pronunciation:</strong> {pron}</p>")
-    
+
     # Etymology
     if info['etymology']:
-        etym = ' '.join(info['etymology'])
+        etym = esc(' '.join(info['etymology']))
         html_parts.append(f"<p><strong>Etymology:</strong> {etym}</p>")
-    
+
     # Definitions by part of speech
     if info['definitions']:
         for pos, defs in info['definitions'].items():
-            html_parts.append(f"<p><strong>{pos}:</strong></p>")
+            html_parts.append(f"<p><strong>{esc(pos)}:</strong></p>")
             html_parts.append("<ol>")
             for defn in defs:
-                html_parts.append(f"<li>{defn['text']}")
-                if defn['examples']:
-                    html_parts.append("<ul style='margin-top: 5px; margin-bottom: 5px;'>")
-                    for example in defn['examples']:
-                        html_parts.append(f"<li><em>{example}</em></li>")
-                    html_parts.append("</ul>")
-                html_parts.append("</li>")
+                html_parts.append(sense_to_html(defn))
             html_parts.append("</ol>")
-    
-    # Synonyms
-    if info['synonyms']:
-        syn_text = ', '.join(info['synonyms'][:15])
-        html_parts.append(f"<p><strong>Synonyms:</strong> {syn_text}")
-        if len(info['synonyms']) > 15:
-            html_parts.append(f" <em>(+{len(info['synonyms']) - 15} more)</em>")
-        html_parts.append("</p>")
-    
-    # Antonyms
-    if info['antonyms']:
-        ant_text = ', '.join(info['antonyms'][:15])
-        html_parts.append(f"<p><strong>Antonyms:</strong> {ant_text}")
-        if len(info['antonyms']) > 15:
-            html_parts.append(f" <em>(+{len(info['antonyms']) - 15} more)</em>")
-        html_parts.append("</p>")
-    
-    # Derived terms
-    if info['derived']:
-        der_text = ', '.join(info['derived'][:10])
-        html_parts.append(f"<p><strong>Derived terms:</strong> {der_text}")
-        if len(info['derived']) > 10:
-            html_parts.append(f" <em>(+{len(info['derived']) - 10} more)</em>")
-        html_parts.append("</p>")
-    
-    # Related terms
-    if info['related']:
-        rel_text = ', '.join(info['related'][:10])
-        html_parts.append(f"<p><strong>Related terms:</strong> {rel_text}")
-        if len(info['related']) > 10:
-            html_parts.append(f" <em>(+{len(info['related']) - 10} more)</em>")
-        html_parts.append("</p>")
-    
+
+    # Synonyms, antonyms, derived and related terms
+    for label, key, limit in (
+        ("Synonyms", 'synonyms', 15),
+        ("Antonyms", 'antonyms', 15),
+        ("Derived terms", 'derived', 10),
+        ("Related terms", 'related', 10),
+    ):
+        items = info[key]
+        if items:
+            text = ', '.join(esc(i) for i in items[:limit])
+            html_parts.append(f"<p><strong>{label}:</strong> {text}")
+            if len(items) > limit:
+                html_parts.append(f" <em>(+{len(items) - limit} more)</em>")
+            html_parts.append("</p>")
+
     return '\n'.join(html_parts)
 
 
@@ -674,9 +710,33 @@ Examples:
     parser.add_argument('language', help='Language of the word (e.g., french, spanish)')
     parser.add_argument('word', help='Word to look up')
     parser.add_argument('--deck', help='Override the deck name')
+    parser.add_argument('--note-type', default=DEFAULT_NOTE_TYPE,
+                        help='Anki note type to use; must have "Front" and "Back" fields '
+                             f'(default: {DEFAULT_NOTE_TYPE})')
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='Add the card without asking for confirmation')
     
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show detailed fetch/parse debug output')
+
     args = parser.parse_args()
-    
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format='%(message)s'
+    )
+
+    try:
+        run(args)
+    except (AnkiError, WiktError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(130)
+
+
+def run(args):
+    """Fetch, preview and (on confirmation) add a card"""
     language = args.language.lower()
     word = args.word
     deck_name = get_deck_name(language, args.deck)
@@ -685,9 +745,6 @@ Examples:
     
     # Check AnkiConnect
     check_anki_connection()
-    
-    # Create deck if needed
-    create_deck_if_needed(deck_name)
     
     # Fetch and parse
     html = fetch_wiktionary_entry(word)
@@ -700,9 +757,10 @@ Examples:
     # Format for Anki
     anki_details = format_for_anki(info)
     
-    # Check for duplicates
+    # Check for duplicates (a deck that doesn't exist yet can't contain any)
     print(f"\nChecking for duplicates in deck '{deck_name}'...")
-    if not can_add_note(deck_name, word, anki_details):
+    note = build_note(deck_name, word, anki_details, audio_url, language, args.note_type)
+    if deck_exists(deck_name) and not can_add_note(note):
         print(f"Error: Card for '{word}' already exists in deck '{deck_name}'")
         sys.exit(1)
     
@@ -714,11 +772,15 @@ Examples:
     
     # Prompt for confirmation
     print(f"\nTarget deck: {deck_name}")
-    response = input("\nAdd this card to Anki? (y/n): ").strip().lower()
+    if args.yes:
+        response = 'y'
+    else:
+        response = input("\nAdd this card to Anki? (y/n): ").strip().lower()
     
     if response == 'y' or response == 'yes':
         print("\nAdding card to Anki...")
-        note_id = add_note_to_anki(deck_name, word, anki_details, audio_url)
+        create_deck_if_needed(deck_name)
+        note_id = add_note_to_anki(note)
         print(f"✓ Card added successfully! (Note ID: {note_id})")
     else:
         print("Card not added.")
