@@ -526,7 +526,11 @@ def resolve_text(conn: sqlite3.Connection, lang: str, text: str) -> dict:
     for token in languages.tokenize(text):
         key = token.lower()
         freq[key] += 1
-        first_seen.setdefault(key, token)
+        # Prefer the lowercase spelling whenever the word ever appears in
+        # lowercase, so a sentence-initial "A" is not read as the letter A;
+        # words that are always capitalised (names) keep their capital.
+        if key not in first_seen or (token == key and first_seen[key] != key):
+            first_seen[key] = token
     resolutions = {key: resolve_token(conn, lang, first_seen[key]) for key in freq}
     return {"freq": freq, "resolutions": resolutions}
 
@@ -588,6 +592,174 @@ def cmd_resolve(args) -> int:
 
 
 # ============================================================================
+# cards: turn the most frequent lemmas of a text into flashcards
+# ============================================================================
+
+from html import escape as html_escape
+
+SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+MAX_SENTENCE_CHARS = 220
+
+
+def sentence_index(text: str) -> Dict[str, str]:
+    """Map each lowercase word to the first reasonably short sentence using it"""
+    index: Dict[str, str] = {}
+    for sentence in SENTENCE_RE.split(text):
+        sentence = " ".join(sentence.split())
+        if not sentence or len(sentence) > MAX_SENTENCE_CHARS:
+            continue
+        for token in languages.tokenize(sentence):
+            index.setdefault(token.lower(), sentence)
+    return index
+
+
+def entry_to_html(entry: dict) -> str:
+    """HTML for one entry, in the same shape as wikt2card's card back"""
+    esc = html_escape
+    parts = [f"<p><strong>{esc(entry['word'])}</strong> <em>{esc(entry['pos'] or '')}</em></p>"]
+    ipas = [(f"{', '.join(s['tags'])}: " if s.get("tags") else "") + s["ipa"]
+            for s in entry["sounds"] if s.get("ipa")]
+    if ipas:
+        parts.append("<p><strong>Pronunciation:</strong> " + "; ".join(esc(i) for i in ipas[:6]) + "</p>")
+    if entry["etymology"]:
+        parts.append(f"<p><strong>Etymology:</strong> {esc(entry['etymology'])}</p>")
+    parts.append("<ol>")
+    for s in entry["senses"]:
+        tags = f" <em>({esc(', '.join(s['tags']))})</em>" if s["tags"] else ""
+        parts.append(f"<li>{esc('; '.join(s['glosses']))}{tags}")
+        if s["examples"]:
+            parts.append("<ul style='margin-top: 5px; margin-bottom: 5px;'>")
+            for ex in s["examples"][:2]:
+                tr = f" &mdash; {esc(ex['translation'])}" if ex["translation"] else ""
+                parts.append(f"<li><em>{esc(ex['text'])}</em>{tr}</li>")
+            parts.append("</ul>")
+        parts.append("</li>")
+    parts.append("</ol>")
+    for label, key, limit in (("Synonyms", "synonyms", 10), ("Antonyms", "antonyms", 10),
+                              ("Derived terms", "derived", 10), ("Related terms", "related", 10)):
+        items = entry[key]
+        if items:
+            more = f" <em>(+{len(items) - limit} more)</em>" if len(items) > limit else ""
+            parts.append(f"<p><strong>{label}:</strong> {', '.join(esc(i) for i in items[:limit])}{more}</p>")
+    return "\n".join(parts)
+
+
+def build_cards(result: dict, text: str, min_count: int = 2, limit: int = 50,
+                skip_top: int = 0, known: frozenset = frozenset()) -> List[dict]:
+    """Pick frequent non-proper-noun lemmas and render a card for each.
+
+    The `skip_top` most frequent lemmas (mostly function words) and any lemma
+    in `known` are left out.
+    """
+    freq, resolutions = result["freq"], result["resolutions"]
+    lemma_count: collections.Counter = collections.Counter()
+    lemma_entries: Dict[str, List[dict]] = {}
+    lemma_forms: Dict[str, List[str]] = collections.defaultdict(list)
+    for key, r in resolutions.items():
+        if not r.entries:
+            continue
+        lemma = r.lemmas[0]
+        wanted = [e for e in r.entries if e["word"] == lemma]
+        if all(e["pos"] == "name" for e in wanted):
+            continue  # proper nouns make poor vocabulary cards
+        lemma_count[lemma] += freq[key]
+        lemma_entries.setdefault(lemma, wanted)
+        lemma_forms[lemma].append(key)
+
+    sentences = sentence_index(text)
+    cards = []
+    for lemma, count in lemma_count.most_common()[skip_top:]:
+        if count < min_count or len(cards) >= limit:
+            break
+        if lemma in known or lemma.lower() in known:
+            continue
+        back = "\n".join(entry_to_html(e) for e in lemma_entries[lemma])
+        forms = sorted(lemma_forms[lemma], key=lambda k: -freq[k])
+        sentence = next((sentences[f] for f in forms if f in sentences), "")
+        if sentence:
+            back += f"\n<p><strong>In the text:</strong> <em>{html_escape(sentence)}</em></p>"
+        cards.append({"front": lemma, "back": back, "count": count, "forms": forms})
+    return cards
+
+
+def load_wikt2card():
+    """Import ../wikt2card/wikt2card.py (needs requests and beautifulsoup4)"""
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "wikt2card" / "wikt2card.py"
+    spec = importlib.util.spec_from_file_location("wikt2card_helpers", path)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except ImportError as e:
+        raise SystemExit(f"Error: --anki needs wikt2card's dependencies ({e}); "
+                         f"run `pip install -r ../wikt2card/requirements.txt`")
+    return module
+
+
+def add_cards_to_anki(cards: List[dict], lang: str, deck: str, note_type: str,
+                      assume_yes: bool) -> int:
+    """Add cards through AnkiConnect, reusing wikt2card's helpers"""
+    w = load_wikt2card()
+    try:
+        w.check_anki_connection()
+        exists = w.deck_exists(deck)
+        notes = []
+        for card in cards:
+            note = w.build_note(deck, card["front"], card["back"], None, lang, note_type)
+            note["tags"] = ["kaikki2card", f"kaikki2card::{lang}"]
+            notes.append(note)
+        if exists:
+            fresh = [n for n in notes if w.can_add_note(n)]
+        else:
+            fresh = notes
+        print(f"{len(notes)} cards, {len(notes) - len(fresh)} already in '{deck}', "
+              f"{len(fresh)} to add")
+        if not fresh:
+            return 0
+        if not assume_yes and input(f"Add {len(fresh)} cards to deck '{deck}'? (y/n): ").strip().lower() not in ("y", "yes"):
+            print("Nothing added.")
+            return 0
+        w.create_deck_if_needed(deck)
+        added = 0
+        for note in fresh:
+            w.add_note_to_anki(note)
+            added += 1
+        print(f"Added {added} cards to '{deck}'.")
+    except w.AnkiError as e:
+        print(f"Error: {e}")
+        return 1
+    return 0
+
+
+def cmd_cards(args) -> int:
+    text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+    result = resolve_text(connect(), args.lang, text)
+    known = frozenset()
+    if args.known:
+        known = frozenset(line.strip() for line in
+                          Path(args.known).read_text(encoding="utf-8").splitlines() if line.strip())
+    cards = build_cards(result, text, args.min_count, args.limit, args.skip_top, known)
+    if not cards:
+        print("No cards: nothing left after --min-count / --skip-top / --known.")
+        return 1
+    print(f"{len(cards)} cards (lemmas seen >= {args.min_count} times, after skipping the "
+          f"{args.skip_top} most frequent and {len(known)} known lemmas)\n")
+    for card in cards[:args.preview]:
+        print(f"{card['front']}  ({card['count']}x: {', '.join(card['forms'][:5])})")
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            for card in cards:
+                back = card["back"].replace("\t", " ").replace("\n", "")
+                fh.write(f"{card['front']}\t{back}\tkaikki2card kaikki2card::{args.lang}\n")
+        print(f"\nWrote {args.out} (tab-separated: Front, Back, Tags; import with Anki's File > Import, "
+              f"allow HTML)")
+    if args.anki:
+        return add_cards_to_anki(cards, args.lang, args.deck or f"kaikki2card {args.lang}",
+                                 args.note_type, args.yes)
+    return 0
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -620,6 +792,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--top', type=int, default=30, help='How many unresolved words to list')
     p.add_argument('--out', help='Write a lemma/count/forms TSV here')
     p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser('cards', help='Make flashcards from the most frequent lemmas of a text')
+    p.add_argument('--lang', required=True, help='Wiktionary language code')
+    p.add_argument('file', help="Text file ('-' for stdin)")
+    p.add_argument('--min-count', type=int, default=2, help='Skip lemmas seen fewer times (default 2)')
+    p.add_argument('--limit', type=int, default=50, help='Maximum number of cards (default 50)')
+    p.add_argument('--skip-top', type=int, default=100,
+                   help='Skip the N most frequent lemmas, mostly function words (default 100)')
+    p.add_argument('--known', help='File of lemmas you already know, one per line')
+    p.add_argument('--preview', type=int, default=15, help='How many cards to list (default 15)')
+    p.add_argument('--out', help='Write cards as a tab-separated file for Anki import')
+    p.add_argument('--anki', action='store_true', help='Add the cards via AnkiConnect')
+    p.add_argument('--deck', help='Deck name for --anki (default: "kaikki2card <lang>")')
+    p.add_argument('--note-type', default='Basic', help='Anki note type with Front/Back fields')
+    p.add_argument('-y', '--yes', action='store_true', help='Do not ask before adding to Anki')
+    p.set_defaults(func=cmd_cards)
     return parser
 
 
