@@ -508,6 +508,86 @@ def cmd_lookup(args) -> int:
 
 
 # ============================================================================
+# resolve: coverage of a whole text
+# ============================================================================
+
+import collections
+
+
+def resolve_text(conn: sqlite3.Connection, lang: str, text: str) -> dict:
+    """Tokenize `text` and resolve every distinct word once.
+
+    Returns the token frequencies and one Resolution per distinct lowercase
+    word (resolved from its first-seen spelling, so a capitalised proper noun
+    can still match its capitalised headword).
+    """
+    freq: collections.Counter = collections.Counter()
+    first_seen: Dict[str, str] = {}
+    for token in languages.tokenize(text):
+        key = token.lower()
+        freq[key] += 1
+        first_seen.setdefault(key, token)
+    resolutions = {key: resolve_token(conn, lang, first_seen[key]) for key in freq}
+    return {"freq": freq, "resolutions": resolutions}
+
+
+def format_coverage(result: dict, top_unresolved: int = 30) -> str:
+    freq, resolutions = result["freq"], result["resolutions"]
+    total_tokens = sum(freq.values())
+    labels = ["exact", "exact+form_of", "mutation", "mutation+form_of",
+              "form-table", "form-table+form_of", "unresolved"]
+    by_form = collections.Counter(r.label for r in resolutions.values())
+    by_token: collections.Counter = collections.Counter()
+    for key, r in resolutions.items():
+        by_token[r.label] += freq[key]
+
+    lines = [f"Tokens: {total_tokens:,}   Distinct words: {len(freq):,}", "",
+             f"{'resolved by':<20}{'distinct':>10}{'%':>8}{'tokens':>12}{'%':>8}"]
+    for label in labels:
+        if by_form[label] or by_token[label]:
+            lines.append(f"{label:<20}{by_form[label]:>10,}{100 * by_form[label] / len(freq):>7.1f}%"
+                         f"{by_token[label]:>12,}{100 * by_token[label] / total_tokens:>7.1f}%")
+    ok_forms = len(freq) - by_form["unresolved"]
+    ok_tokens = total_tokens - by_token["unresolved"]
+    lines.append(f"{'TOTAL resolved':<20}{ok_forms:>10,}{100 * ok_forms / len(freq):>7.1f}%"
+                 f"{ok_tokens:>12,}{100 * ok_tokens / total_tokens:>7.1f}%")
+
+    lemma_counts: collections.Counter = collections.Counter()
+    ambiguous = 0
+    for key, r in resolutions.items():
+        if r.lemmas:
+            lemma_counts[r.lemmas[0]] += freq[key]
+            ambiguous += len(r.lemmas) > 1
+    lines += ["", f"Distinct lemmas (first candidate): {len(lemma_counts):,}   "
+                  f"words with >1 candidate lemma: {ambiguous:,}"]
+
+    unresolved = sorted((k for k, r in resolutions.items() if r.method == "unresolved"),
+                        key=lambda k: -freq[k])
+    if unresolved:
+        lines += ["", f"Top {min(top_unresolved, len(unresolved))} unresolved (by frequency):"]
+        lines.append("  " + ", ".join(f"{k} ({freq[k]})" for k in unresolved[:top_unresolved]))
+    return "\n".join(lines)
+
+
+def cmd_resolve(args) -> int:
+    text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+    result = resolve_text(connect(), args.lang, text)
+    print(format_coverage(result, args.top))
+    if args.out:
+        rows = collections.defaultdict(lambda: [0, []])
+        for key, r in result["resolutions"].items():
+            lemma = r.lemmas[0] if r.lemmas else ""
+            rows[lemma][0] += result["freq"][key]
+            rows[lemma][1].append(key)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write("lemma\tcount\tforms\n")
+            for lemma, (count, forms) in sorted(rows.items(), key=lambda kv: -kv[1][0]):
+                fh.write(f"{lemma or '(unresolved)'}\t{count}\t{' '.join(sorted(forms)[:8])}\n")
+        print(f"\nWrote {args.out}")
+    return 0
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -533,6 +613,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--lang', required=True, help='Wiktionary language code')
     p.add_argument('word')
     p.set_defaults(func=cmd_lookup)
+
+    p = sub.add_parser('resolve', help='Report how many words of a text resolve to entries')
+    p.add_argument('--lang', required=True, help='Wiktionary language code')
+    p.add_argument('file', help="Text file ('-' for stdin)")
+    p.add_argument('--top', type=int, default=30, help='How many unresolved words to list')
+    p.add_argument('--out', help='Write a lemma/count/forms TSV here')
+    p.set_defaults(func=cmd_resolve)
     return parser
 
 
