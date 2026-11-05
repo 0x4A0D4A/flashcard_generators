@@ -333,6 +333,174 @@ def cmd_build(args) -> int:
 
 
 # ============================================================================
+# lookup and resolution
+# ============================================================================
+
+from dataclasses import dataclass, field
+from typing import List
+
+# Make the sibling module importable however the script is launched (symlink on
+# PATH, `python3 -I`, ...).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import languages  # noqa: E402
+
+
+def connect() -> sqlite3.Connection:
+    if not db_path().exists():
+        raise SystemExit(f"Error: {db_path()} not found; run `kaikki2card build --lang <code>` first")
+    return sqlite3.connect(db_path())
+
+
+def find_entries(conn: sqlite3.Connection, lang: str, word: str) -> List[dict]:
+    """All entries whose headword is exactly `word`"""
+    rows = conn.execute(
+        "SELECT id, word, pos, data FROM entries WHERE lang = ? AND word = ? ORDER BY id",
+        (lang, word)).fetchall()
+    return [{"id": r[0], "word": r[1], "pos": r[2], **json.loads(r[3])} for r in rows]
+
+
+def find_by_form(conn: sqlite3.Connection, lang: str, form: str) -> List[dict]:
+    """Entries that list `form` as one of their inflected forms"""
+    ids = [r[0] for r in conn.execute(
+        "SELECT DISTINCT entry_id FROM forms WHERE lang = ? AND form = ?", (lang, form))]
+    out = []
+    for entry_id in ids:
+        r = conn.execute("SELECT id, word, pos, data FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        out.append({"id": r[0], "word": r[1], "pos": r[2], **json.loads(r[3])})
+    return out
+
+
+def is_stub(entry: dict) -> bool:
+    """True if every sense just points at another word (mutation, verbal noun, ...)"""
+    senses = entry["senses"]
+    return bool(senses) and all(s["form_of"] or s["alt_of"] for s in senses)
+
+
+def stub_targets(entry: dict) -> List[str]:
+    targets: List[str] = []
+    for s in entry["senses"]:
+        for w in s["form_of"] + s["alt_of"]:
+            if w not in targets:
+                targets.append(w)
+    return targets
+
+
+def follow_stubs(conn: sqlite3.Connection, lang: str, entries: List[dict],
+                 max_depth: int = 3) -> tuple:
+    """Replace form-of stubs by the entries they point at.
+
+    Returns (entries, followed). A stub whose target is missing from the
+    database is kept as-is so the caller still has something to show.
+    """
+    followed = False
+    result: List[dict] = []
+    seen = set()
+    queue = [(e, 0) for e in entries]
+    while queue:
+        entry, depth = queue.pop(0)
+        if entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+        if is_stub(entry) and depth < max_depth:
+            targets = []
+            for word in stub_targets(entry):
+                targets.extend(find_entries(conn, lang, word))
+            if targets:
+                followed = True
+                queue.extend((t, depth + 1) for t in targets)
+                continue
+        result.append(entry)
+    return result, followed
+
+
+@dataclass
+class Resolution:
+    token: str
+    method: str                # exact | mutation | form-table | unresolved
+    followed_stub: bool = False
+    candidate: str = ""        # the candidate spelling that matched
+    entries: List[dict] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        if self.method == "unresolved":
+            return "unresolved"
+        return self.method + ("+form_of" if self.followed_stub else "")
+
+    @property
+    def lemmas(self) -> List[str]:
+        out: List[str] = []
+        for e in self.entries:
+            if e["word"] not in out:
+                out.append(e["word"])
+        return out
+
+
+def resolve_token(conn: sqlite3.Connection, lang: str, token: str) -> Resolution:
+    """Map a surface token to dictionary entries.
+
+    Order: headword match on the token (or its lowercase form), headword match
+    on a rule-generated candidate (mutations), then the inflected-forms table.
+    """
+    candidates = languages.get_candidates_fn(lang)(token)
+    plain = {token, token.lower()}
+
+    for cand in candidates:
+        entries = find_entries(conn, lang, cand)
+        if entries:
+            entries, followed = follow_stubs(conn, lang, entries)
+            return Resolution(token, "exact" if cand in plain else "mutation",
+                              followed, cand, entries)
+
+    for cand in candidates:
+        entries = find_by_form(conn, lang, cand)
+        if entries:
+            entries, followed = follow_stubs(conn, lang, entries)
+            return Resolution(token, "form-table", followed, cand, entries)
+
+    return Resolution(token, "unresolved")
+
+
+# ---- display ---------------------------------------------------------------
+
+def format_entry_text(entry: dict) -> str:
+    """Plain-text rendering of one compact entry"""
+    lines = [f"{entry['word']}  [{entry['pos']}]"]
+    ipas = [f"{', '.join(s['tags'])}: {s['ipa']}" if s.get("tags") else s["ipa"]
+            for s in entry["sounds"] if s.get("ipa")]
+    if ipas:
+        lines.append("  IPA: " + "  ".join(ipas))
+    for i, s in enumerate(entry["senses"], 1):
+        tags = f" ({', '.join(s['tags'])})" if s["tags"] else ""
+        lines.append(f"  {i}. {'; '.join(s['glosses'])}{tags}")
+        for ex in s["examples"][:2]:
+            tr = f" -- {ex['translation']}" if ex["translation"] else ""
+            lines.append(f"       * {ex['text']}{tr}")
+    if entry["etymology"]:
+        lines.append(f"  Etymology: {entry['etymology']}")
+    for label, key in (("Synonyms", "synonyms"), ("Antonyms", "antonyms"),
+                       ("Derived", "derived"), ("Related", "related")):
+        if entry[key]:
+            more = f" (+{len(entry[key]) - 10} more)" if len(entry[key]) > 10 else ""
+            lines.append(f"  {label}: {', '.join(entry[key][:10])}{more}")
+    return "\n".join(lines)
+
+
+def cmd_lookup(args) -> int:
+    conn = connect()
+    res = resolve_token(conn, args.lang, args.word)
+    if res.method == "unresolved":
+        print(f"'{args.word}' not found ({args.lang}); tried: "
+              f"{', '.join(languages.get_candidates_fn(args.lang)(args.word))}")
+        return 1
+    note = "" if res.candidate == args.word else f" via '{res.candidate}'"
+    print(f"[{res.label}{note}] -> {', '.join(res.lemmas)}\n")
+    for entry in res.entries:
+        print(format_entry_text(entry) + "\n")
+    return 0
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -353,6 +521,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--refresh', action='store_true',
                    help='Re-extract the language from the raw dump first')
     p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser('lookup', help='Look up one word in the local database')
+    p.add_argument('--lang', required=True, help='Wiktionary language code')
+    p.add_argument('word')
+    p.set_defaults(func=cmd_lookup)
     return parser
 
 
