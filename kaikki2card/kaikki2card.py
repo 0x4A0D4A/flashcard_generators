@@ -21,6 +21,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -210,6 +211,12 @@ def _word_list(items) -> list:
     return out
 
 
+def clean_etymology(text: str) -> str:
+    """Drop template residue such as a leading "PIE word\\n *gʷḗn" header"""
+    text = re.sub(r"\A(?:[^\n]* word\n[^\n]*\n)+", "", text.strip())
+    return text.strip()
+
+
 def compact_entry(entry: dict) -> dict:
     """Reduce a raw entry to the fields cards need (drops templates etc.)"""
     senses = []
@@ -250,7 +257,7 @@ def compact_entry(entry: dict) -> dict:
     return {
         "senses": senses,
         "sounds": sounds,
-        "etymology": (entry.get("etymology_text") or "").strip(),
+        "etymology": clean_etymology(entry.get("etymology_text") or ""),
         "synonyms": synonyms,
         "antonyms": antonyms,
         "derived": _word_list(entry.get("derived")),
