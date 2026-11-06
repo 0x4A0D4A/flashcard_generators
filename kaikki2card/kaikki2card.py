@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 log = logging.getLogger('kaikki2card')
 
@@ -699,8 +699,12 @@ def load_wikt2card():
 
 
 def add_cards_to_anki(cards: List[dict], lang: str, deck: str, note_type: str,
-                      assume_yes: bool) -> int:
-    """Add cards through AnkiConnect, reusing wikt2card's helpers"""
+                      assume_yes: bool, tags: Sequence[str] = ()) -> int:
+    """Add cards through AnkiConnect, reusing wikt2card's helpers.
+
+    `tags` are added to every new note. A card already in the deck is skipped
+    and left untouched, so it does not gain these tags.
+    """
     w = load_wikt2card()
     try:
         w.check_anki_connection()
@@ -708,7 +712,7 @@ def add_cards_to_anki(cards: List[dict], lang: str, deck: str, note_type: str,
         notes = []
         for card in cards:
             note = w.build_note(deck, card["front"], card["back"], None, lang, note_type)
-            note["tags"] = ["kaikki2card", f"kaikki2card::{lang}"]
+            note["tags"] = ["kaikki2card", f"kaikki2card::{lang}", *tags]
             notes.append(note)
         if exists:
             fresh = [n for n in notes if w.can_add_note(n)]
@@ -733,8 +737,20 @@ def add_cards_to_anki(cards: List[dict], lang: str, deck: str, note_type: str,
     return 0
 
 
+def validate_tags(tags: Sequence[str]) -> Optional[str]:
+    """Error message for the first unusable tag, else None (Anki splits tags on spaces)"""
+    for tag in tags:
+        if not tag.strip() or any(ch.isspace() for ch in tag):
+            return f"invalid --tag {tag!r}: tags cannot be empty or contain whitespace"
+    return None
+
+
 def cmd_cards(args) -> int:
-    text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+    error = validate_tags(args.tag)
+    if error:
+        print(f"Error: {error}")
+        return 2
+    text =sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
     result = resolve_text(connect(), args.lang, text)
     known = frozenset()
     if args.known:
@@ -750,14 +766,15 @@ def cmd_cards(args) -> int:
         print(f"{card['front']}  ({card['count']}x: {', '.join(card['forms'][:5])})")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
+            tag_column = " ".join(["kaikki2card", f"kaikki2card::{args.lang}", *args.tag])
             for card in cards:
                 back = card["back"].replace("\t", " ").replace("\n", "")
-                fh.write(f"{card['front']}\t{back}\tkaikki2card kaikki2card::{args.lang}\n")
+                fh.write(f"{card['front']}\t{back}\t{tag_column}\n")
         print(f"\nWrote {args.out} (tab-separated: Front, Back, Tags; import with Anki's File > Import, "
               f"allow HTML)")
     if args.anki:
         return add_cards_to_anki(cards, args.lang, args.deck or f"kaikki2card {args.lang}",
-                                 args.note_type, args.yes)
+                                 args.note_type, args.yes, args.tag)
     return 0
 
 
@@ -807,6 +824,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--out', help='Write cards as a tab-separated file for Anki import')
     p.add_argument('--anki', action='store_true', help='Add the cards via AnkiConnect')
     p.add_argument('--deck', help='Deck name for --anki (default: "kaikki2card <lang>")')
+    p.add_argument('--tag', action='append', default=[], metavar='TAG',
+                   help='Extra tag for every card added (repeatable, e.g. book::niamh); '
+                        'cards already in the deck are skipped, not re-tagged')
     p.add_argument('--note-type', default='Basic', help='Anki note type with Front/Back fields')
     p.add_argument('-y', '--yes', action='store_true', help='Do not ask before adding to Anki')
     p.set_defaults(func=cmd_cards)

@@ -205,7 +205,7 @@ def anki(monkeypatch):
 
     class Fake:
         def __init__(self):
-            self.decks, self.calls, self.dupes = [], [], set()
+            self.decks, self.calls, self.dupes, self.added = [], [], set(), []
 
         def __call__(self, action, **params):
             self.calls.append(action)
@@ -219,6 +219,7 @@ def anki(monkeypatch):
             if action == "canAddNotesWithErrorDetail":
                 return [{"canAdd": params["notes"][0]["fields"]["Front"] not in self.dupes}]
             if action == "addNote":
+                self.added.append(params["note"])
                 return 1
             raise AssertionError(action)
 
@@ -243,6 +244,49 @@ def test_anki_skips_duplicates_in_existing_deck(anki):
     anki.dupes.add("bean")
     k.add_cards_to_anki(CARDS, "ga", "Deck", "Basic", assume_yes=True)
     assert anki.calls.count("addNote") == 1
+
+
+def test_anki_default_tags_without_tag_option(anki):
+    k.add_cards_to_anki(CARDS, "ga", "Deck", "Basic", assume_yes=True)
+    assert all(n["tags"] == ["kaikki2card", "kaikki2card::ga"] for n in anki.added)
+
+
+def test_anki_extra_tags_on_new_notes_only(anki):
+    anki.decks.append("Deck")
+    anki.dupes.add("bean")
+    k.add_cards_to_anki(CARDS, "ga", "Deck", "Basic", assume_yes=True,
+                        tags=["book::niamh", "ch01"])
+    # the existing card is skipped (not re-added, not re-tagged); the new one gets the tags
+    assert [n["fields"]["Front"] for n in anki.added] == ["cat"]
+    assert anki.added[0]["tags"] == ["kaikki2card", "kaikki2card::ga", "book::niamh", "ch01"]
+    assert "updateNoteTags" not in anki.calls and "addTags" not in anki.calls
+
+
+def test_validate_tags():
+    assert k.validate_tags(["book::niamh", "ch01"]) is None
+    assert k.validate_tags([]) is None
+    assert "whitespace" in k.validate_tags(["book niamh"])
+    assert "whitespace" in k.validate_tags(["ok", " "])
+
+
+def test_cards_cli_tag_goes_into_tsv_and_bad_tag_rejected(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    raw = k.raw_path()
+    raw.parent.mkdir(parents=True)
+    with gzip.open(raw, "wb") as fh:
+        for line in DUMP_LINES:
+            fh.write(line + b"\n")
+    assert k.main(["build", "--lang", "ga"]) == 0
+    text = tmp_path / "t.txt"
+    text.write_text(TEXT, encoding="utf-8")
+    out = tmp_path / "c.tsv"
+    assert k.main(["cards", "--lang", "ga", str(text), "--skip-top", "0", "--out", str(out),
+                   "--tag", "book::niamh", "--tag", "ch01"]) == 0
+    rows = out.read_text(encoding="utf-8").splitlines()
+    assert rows and all(r.split("\t")[2] == "kaikki2card kaikki2card::ga book::niamh ch01" for r in rows)
+    capsys.readouterr()
+    assert k.main(["cards", "--lang", "ga", str(text), "--tag", "bad tag"]) == 2
+    assert "invalid --tag" in capsys.readouterr().out
 
 
 def test_anki_declined_adds_nothing(anki, monkeypatch):
