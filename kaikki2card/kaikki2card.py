@@ -646,19 +646,34 @@ def entry_to_html(entry: dict) -> str:
     return "\n".join(parts)
 
 
-def pick_audio_url(entries: List[dict]) -> Optional[str]:
-    """The first pronunciation recording of a lemma's entries, as a URL.
+def pick_audio_sources(entries: List[dict]) -> List[tuple]:
+    """(url, mime type) pairs for the first pronunciation recording of a lemma.
 
     Wiktionary lists recordings in page order, so the first is the lead one.
-    mp3 is preferred over ogg because Anki on iOS cannot play Ogg Vorbis.
+    mp3 comes before ogg because Anki on iOS cannot play Ogg Vorbis; the
+    player takes the first source it supports.
     """
     for entry in entries:
         for sound in entry.get("sounds", []):
-            for key in ("mp3_url", "ogg_url"):
-                url = sound.get(key)
-                if url and url.startswith(("https://", "http://")):
-                    return url
-    return None
+            sources = [(sound[key], mime)
+                       for key, mime in (("mp3_url", "audio/mpeg"), ("ogg_url", "audio/ogg"))
+                       if sound.get(key, "").startswith(("https://", "http://"))]
+            if sources:
+                return sources
+    return []
+
+
+def audio_html(sources: Sequence[tuple]) -> str:
+    """An autoplaying <audio> element streaming from the source URLs.
+
+    Nothing is downloaded or stored: the client fetches the file when the
+    card is shown, and with no connection the player just stays silent.
+    """
+    if not sources:
+        return ""
+    tags = "".join(f'<source src="{html_escape(url, quote=True)}" type="{mime}">'
+                   for url, mime in sources)
+    return f'<audio controls autoplay preload="none">{tags}</audio>'
 
 
 def build_cards(result: dict, text: str, min_count: int = 2, limit: Optional[int] = None,
@@ -691,12 +706,14 @@ def build_cards(result: dict, text: str, min_count: int = 2, limit: Optional[int
         if lemma in known or lemma.lower() in known:
             continue
         back = "\n".join(entry_to_html(e) for e in lemma_entries[lemma])
+        audio = audio_html(pick_audio_sources(lemma_entries[lemma]))
+        if audio:
+            back = f"{audio}\n{back}"
         forms = sorted(lemma_forms[lemma], key=lambda k: -freq[k])
         sentence = next((sentences[f] for f in forms if f in sentences), "")
         if sentence:
             back += f"\n<p><strong>In the text:</strong> <em>{html_escape(sentence)}</em></p>"
-        cards.append({"front": lemma, "back": back, "count": count, "forms": forms,
-                      "audio_url": pick_audio_url(lemma_entries[lemma])})
+        cards.append({"front": lemma, "back": back, "count": count, "forms": forms})
     return cards
 
 
@@ -727,8 +744,9 @@ def add_cards_to_anki(cards: List[dict], lang: str, deck: str, note_type: str,
         exists = w.deck_exists(deck)
         notes = []
         for card in cards:
-            note = w.build_note(deck, card["front"], card["back"], card.get("audio_url"),
-                                lang, note_type)
+            # Audio is an <audio> tag inside the Back field; never ask AnkiConnect to
+            # download media (Commons answers 403 to its downloader).
+            note = w.build_note(deck, card["front"], card["back"], None, lang, note_type)
             note["tags"] = ["kaikki2card", f"kaikki2card::{lang}", *tags]
             notes.append(note)
         if exists:
@@ -782,7 +800,7 @@ def cmd_cards(args) -> int:
     print(f"{len(cards)} cards (lemmas seen >= {args.min_count} times, after skipping the "
           f"{args.skip_top} most frequent and {len(known)} known lemmas)\n")
     for card in cards[:args.preview]:
-        audio = "  [audio]" if card.get("audio_url") else ""
+        audio = "  [audio]" if "<audio" in card["back"] else ""
         print(f"{card['front']}  ({card['count']}x: {', '.join(card['forms'][:5])}){audio}")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:

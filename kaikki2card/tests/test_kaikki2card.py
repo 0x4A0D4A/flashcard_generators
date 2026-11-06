@@ -19,6 +19,10 @@ sys.path.insert(0, str(HERE.parent))
 import kaikki2card as k  # noqa: E402
 
 
+MP3 = "https://upload.wikimedia.org/wikipedia/commons/transcoded/f/f2/Fr-%C3%A9tranger.ogg/Fr-%C3%A9tranger.ogg.mp3"
+OGG = "https://upload.wikimedia.org/wikipedia/commons/f/f2/Fr-%C3%A9tranger.ogg"
+
+
 def entry(word, pos="noun", lang_code="ga", senses=None, **extra):
     e = {"word": word, "pos": pos, "lang": "Irish", "lang_code": lang_code,
          "senses": senses if senses is not None else [{"glosses": [f"gloss of {word}"]}]}
@@ -46,7 +50,8 @@ DUMP = [
     entry("bhean", senses=[{"glosses": ["lenited form of bean"], "tags": ["form-of", "lenition"],
                             "form_of": [{"word": "bean"}]}]),
     entry("cat", senses=[{"glosses": ["cat"]}]),                         # no stub for "gcat"
-    entry("bád", senses=[{"glosses": ["boat"]}]),
+    entry("bád", senses=[{"glosses": ["boat"]}],
+          sounds=[{"audio": "Ga-bád.ogg", "ogg_url": OGG, "mp3_url": MP3}]),
     entry("a", senses=[{"glosses": ["vocative particle"]}]),
     entry("A", senses=[{"glosses": ["the letter A"]}]),
     entry("Murchadh", pos="name", senses=[{"glosses": ["a male given name"]}]),
@@ -276,33 +281,42 @@ def test_anki_skips_duplicates_in_existing_deck(anki):
     assert anki.calls.count("addNote") == 1
 
 
-MP3 = "https://upload.wikimedia.org/wikipedia/commons/transcoded/f/f2/Fr-%C3%A9tranger.ogg/Fr-%C3%A9tranger.ogg.mp3"
-OGG = "https://upload.wikimedia.org/wikipedia/commons/f/f2/Fr-%C3%A9tranger.ogg"
-
-
-def test_pick_audio_url_prefers_mp3_then_ogg_and_ignores_junk():
-    assert k.pick_audio_url([]) is None
-    assert k.pick_audio_url([{"sounds": [{"ipa": "/x/"}]}]) is None
-    assert k.pick_audio_url([{"sounds": [{"ogg_url": OGG, "mp3_url": MP3}]}]) == MP3
-    assert k.pick_audio_url([{"sounds": [{"ogg_url": OGG}]}]) == OGG
-    assert k.pick_audio_url([{"sounds": [{"mp3_url": "file:///etc/passwd"}]}]) is None
+def test_pick_audio_sources_prefers_mp3_then_ogg_and_ignores_junk():
+    assert k.pick_audio_sources([]) == []
+    assert k.pick_audio_sources([{"sounds": [{"ipa": "/x/"}]}]) == []
+    assert k.pick_audio_sources([{"sounds": [{"ogg_url": OGG, "mp3_url": MP3}]}]) == \
+        [(MP3, "audio/mpeg"), (OGG, "audio/ogg")]
+    assert k.pick_audio_sources([{"sounds": [{"ogg_url": OGG}]}]) == [(OGG, "audio/ogg")]
+    assert k.pick_audio_sources([{"sounds": [{"mp3_url": "file:///etc/passwd"}]}]) == []
     # first recording wins, across entries
-    assert k.pick_audio_url([{"sounds": []}, {"sounds": [{"mp3_url": MP3}, {"mp3_url": OGG}]}]) == MP3
+    assert k.pick_audio_sources([{"sounds": []}, {"sounds": [{"mp3_url": MP3}, {"mp3_url": OGG}]}]) == \
+        [(MP3, "audio/mpeg")]
 
 
-def test_audio_survives_compact_entry_and_reaches_the_card(conn):
-    e = k.compact_entry(entry("x", sounds=[{"audio": "a.ogg", "ogg_url": OGG, "mp3_url": MP3}]))
-    assert k.pick_audio_url([e]) == MP3
+def test_audio_html_streams_both_sources_and_escapes():
+    assert k.audio_html([]) == ""
+    html = k.audio_html([(MP3, "audio/mpeg"), (OGG, "audio/ogg")])
+    assert html.startswith("<audio controls autoplay") and html.endswith("</audio>")
+    assert f'<source src="{MP3}" type="audio/mpeg">' in html
+    assert html.index("audio/mpeg") < html.index("audio/ogg")
+    evil = k.audio_html([('https://x/"onerror="y', "audio/mpeg")])
+    assert '"onerror="' not in evil and "&quot;" in evil
 
 
-def test_anki_sends_audio_for_cards_that_have_it(anki):
-    cards = [{**CARDS[0], "audio_url": MP3}, CARDS[1]]
+def test_audio_survives_compact_entry_and_reaches_the_card_back(conn):
+    cards = {c["front"]: c for c in cards_for(conn, min_count=2)}
+    assert cards["bád"]["back"].startswith("<audio controls autoplay")
+    assert MP3 in cards["bád"]["back"] and OGG in cards["bád"]["back"]
+    assert "<audio" not in cards["bean"]["back"]  # no recording -> no player
+
+
+def test_anki_gets_audio_inside_back_and_never_an_audio_download(anki):
+    cards = [{**CARDS[0], "back": k.audio_html([(MP3, "audio/mpeg")]) + CARDS[0]["back"]}, CARDS[1]]
     k.add_cards_to_anki(cards, "fr", "Deck", "Basic", assume_yes=True)
     with_audio, without = anki.added
-    assert with_audio["audio"][0]["url"] == MP3
-    assert with_audio["audio"][0]["fields"] == ["Front"]
-    assert with_audio["audio"][0]["filename"].endswith(".mp3")
-    assert "audio" not in without
+    assert "audio" not in with_audio and "audio" not in without  # no AnkiConnect download
+    assert with_audio["fields"]["Front"] == "bean"               # Front stays the plain word
+    assert MP3 in with_audio["fields"]["Back"]
 
 
 def test_anki_default_tags_without_tag_option(anki):

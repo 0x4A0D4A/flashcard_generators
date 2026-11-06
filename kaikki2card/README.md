@@ -142,11 +142,18 @@ first, so some picks are wrong or merely plausible (`bhean`->`bean`/`bain`,
 - **Irish has almost no audio or examples in Wiktionary**: audio on 10 entries,
   about 2,300 real examples. Cards carry the in-text sentence instead. French is
   much better covered (about 23% of entries have a recording).
-- **Audio** is attached by `--anki` only: the first recording on the lemma's
-  entries (mp3 preferred) goes onto the Front field and AnkiConnect downloads
-  it from Wikimedia Commons. Cards already in the deck are skipped, so they do
-  not gain audio retroactively. `--out` TSVs carry no audio. `cards` marks
-  cards that have a recording with `[audio]` in the preview.
+- **Audio is streamed, not stored.** The database only holds *links* to the
+  recordings on Wikimedia Commons. A card whose lemma has a recording gets an
+  autoplaying `<audio>` element (mp3 first, ogg as fallback) at the top of its
+  Back field, so the client fetches the file when the card is shown, one file
+  per review. Nothing is downloaded when cards are made, nothing is stored in
+  the collection, and with no connection the player stays silent. Autoplay
+  depends on the Anki client; `controls` gives a play button when it is
+  blocked. AnkiConnect is deliberately not asked to download the files:
+  Commons answers its generic User-Agent with 403. Cards already in the deck
+  are skipped, so they do not gain audio retroactively. `cards` marks cards
+  that have a recording with `[audio]` in the preview; `--out` TSVs carry the
+  element in the Back column.
 - Etymology and some `forms` still contain template residue after cleaning
   (only the leading `X word\n form` header is stripped).
 - `--anki` is covered by tests against a fake AnkiConnect but has **not been run
