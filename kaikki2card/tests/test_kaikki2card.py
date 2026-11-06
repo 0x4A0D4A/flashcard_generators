@@ -173,6 +173,36 @@ def test_cards_skip_proper_nouns_and_rank_by_frequency(conn):
     assert cards[0]["count"] >= cards[-1]["count"]
 
 
+def test_cards_have_no_limit_by_default(conn):
+    all_cards = cards_for(conn, min_count=1)
+    assert len(all_cards) > 2
+    assert len(cards_for(conn, min_count=1, limit=2)) == 2
+    assert [c["front"] for c in cards_for(conn, min_count=1, limit=2)] == \
+        [c["front"] for c in all_cards[:2]]
+
+
+def test_cards_cli_limit_is_optional_and_validated(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    raw = k.raw_path()
+    raw.parent.mkdir(parents=True)
+    with gzip.open(raw, "wb") as fh:
+        for line in DUMP_LINES:
+            fh.write(line + b"\n")
+    assert k.main(["build", "--lang", "ga"]) == 0
+    text = tmp_path / "t.txt"
+    text.write_text(TEXT, encoding="utf-8")
+    out = tmp_path / "c.tsv"
+    assert k.main(["cards", "--lang", "ga", str(text), "--skip-top", "0", "--min-count", "1",
+                   "--out", str(out)]) == 0
+    unlimited = len(out.read_text(encoding="utf-8").splitlines())
+    assert k.main(["cards", "--lang", "ga", str(text), "--skip-top", "0", "--min-count", "1",
+                   "--limit", "1", "--out", str(out)]) == 0
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 1 < unlimited
+    capsys.readouterr()
+    assert k.main(["cards", "--lang", "ga", str(text), "--limit", "0"]) == 2
+    assert "--limit must be at least 1" in capsys.readouterr().out
+
+
 def test_cards_min_count_skip_top_and_known(conn):
     assert cards_for(conn, min_count=5) == []
     top = cards_for(conn, min_count=2)[0]["front"]

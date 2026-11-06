@@ -646,12 +646,12 @@ def entry_to_html(entry: dict) -> str:
     return "\n".join(parts)
 
 
-def build_cards(result: dict, text: str, min_count: int = 2, limit: int = 50,
+def build_cards(result: dict, text: str, min_count: int = 2, limit: Optional[int] = None,
                 skip_top: int = 0, known: frozenset = frozenset()) -> List[dict]:
     """Pick frequent non-proper-noun lemmas and render a card for each.
 
     The `skip_top` most frequent lemmas (mostly function words) and any lemma
-    in `known` are left out.
+    in `known` are left out. `limit=None` (the default) keeps every lemma.
     """
     freq, resolutions = result["freq"], result["resolutions"]
     lemma_count: collections.Counter = collections.Counter()
@@ -671,7 +671,7 @@ def build_cards(result: dict, text: str, min_count: int = 2, limit: int = 50,
     sentences = sentence_index(text)
     cards = []
     for lemma, count in lemma_count.most_common()[skip_top:]:
-        if count < min_count or len(cards) >= limit:
+        if count < min_count or (limit is not None and len(cards) >= limit):
             break
         if lemma in known or lemma.lower() in known:
             continue
@@ -747,6 +747,8 @@ def validate_tags(tags: Sequence[str]) -> Optional[str]:
 
 def cmd_cards(args) -> int:
     error = validate_tags(args.tag)
+    if args.limit is not None and args.limit < 1:
+        error = "--limit must be at least 1 (omit it to keep every word)"
     if error:
         print(f"Error: {error}")
         return 2
@@ -816,7 +818,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--lang', required=True, help='Wiktionary language code')
     p.add_argument('file', help="Text file ('-' for stdin)")
     p.add_argument('--min-count', type=int, default=2, help='Skip lemmas seen fewer times (default 2)')
-    p.add_argument('--limit', type=int, default=50, help='Maximum number of cards (default 50)')
+    p.add_argument('--limit', type=int, default=None,
+                   help='Maximum number of cards, most frequent first (default: no limit)')
     p.add_argument('--skip-top', type=int, default=100,
                    help='Skip the N most frequent lemmas, mostly function words (default 100)')
     p.add_argument('--known', help='File of lemmas you already know, one per line')

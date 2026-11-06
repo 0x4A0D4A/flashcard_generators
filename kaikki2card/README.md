@@ -65,7 +65,9 @@ Observed by reading the real raw file, not the deprecated per-language
 a newer raw dump. `cards` skips proper nouns, the `--skip-top` most frequent
 lemmas (default 100, mostly function words) and any lemma listed in a
 `--known FILE`, and adds the first short sentence of the text that uses the
-word. `--anki` reuses `../wikt2card`'s AnkiConnect helpers (so it needs
+word. It makes a card for every remaining lemma seen at least `--min-count`
+times (default 2; use `--min-count 1` for every word); `--limit N` caps the
+list to the N most frequent. `--anki` reuses `../wikt2card`'s AnkiConnect helpers (so it needs
 `pip install -r ../wikt2card/requirements.txt`) and skips cards already in the
 deck. Nothing is written to Anki without `--anki`.
 
