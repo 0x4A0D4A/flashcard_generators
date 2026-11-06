@@ -276,6 +276,35 @@ def test_anki_skips_duplicates_in_existing_deck(anki):
     assert anki.calls.count("addNote") == 1
 
 
+MP3 = "https://upload.wikimedia.org/wikipedia/commons/transcoded/f/f2/Fr-%C3%A9tranger.ogg/Fr-%C3%A9tranger.ogg.mp3"
+OGG = "https://upload.wikimedia.org/wikipedia/commons/f/f2/Fr-%C3%A9tranger.ogg"
+
+
+def test_pick_audio_url_prefers_mp3_then_ogg_and_ignores_junk():
+    assert k.pick_audio_url([]) is None
+    assert k.pick_audio_url([{"sounds": [{"ipa": "/x/"}]}]) is None
+    assert k.pick_audio_url([{"sounds": [{"ogg_url": OGG, "mp3_url": MP3}]}]) == MP3
+    assert k.pick_audio_url([{"sounds": [{"ogg_url": OGG}]}]) == OGG
+    assert k.pick_audio_url([{"sounds": [{"mp3_url": "file:///etc/passwd"}]}]) is None
+    # first recording wins, across entries
+    assert k.pick_audio_url([{"sounds": []}, {"sounds": [{"mp3_url": MP3}, {"mp3_url": OGG}]}]) == MP3
+
+
+def test_audio_survives_compact_entry_and_reaches_the_card(conn):
+    e = k.compact_entry(entry("x", sounds=[{"audio": "a.ogg", "ogg_url": OGG, "mp3_url": MP3}]))
+    assert k.pick_audio_url([e]) == MP3
+
+
+def test_anki_sends_audio_for_cards_that_have_it(anki):
+    cards = [{**CARDS[0], "audio_url": MP3}, CARDS[1]]
+    k.add_cards_to_anki(cards, "fr", "Deck", "Basic", assume_yes=True)
+    with_audio, without = anki.added
+    assert with_audio["audio"][0]["url"] == MP3
+    assert with_audio["audio"][0]["fields"] == ["Front"]
+    assert with_audio["audio"][0]["filename"].endswith(".mp3")
+    assert "audio" not in without
+
+
 def test_anki_default_tags_without_tag_option(anki):
     k.add_cards_to_anki(CARDS, "ga", "Deck", "Basic", assume_yes=True)
     assert all(n["tags"] == ["kaikki2card", "kaikki2card::ga"] for n in anki.added)

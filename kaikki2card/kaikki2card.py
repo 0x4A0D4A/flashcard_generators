@@ -646,6 +646,21 @@ def entry_to_html(entry: dict) -> str:
     return "\n".join(parts)
 
 
+def pick_audio_url(entries: List[dict]) -> Optional[str]:
+    """The first pronunciation recording of a lemma's entries, as a URL.
+
+    Wiktionary lists recordings in page order, so the first is the lead one.
+    mp3 is preferred over ogg because Anki on iOS cannot play Ogg Vorbis.
+    """
+    for entry in entries:
+        for sound in entry.get("sounds", []):
+            for key in ("mp3_url", "ogg_url"):
+                url = sound.get(key)
+                if url and url.startswith(("https://", "http://")):
+                    return url
+    return None
+
+
 def build_cards(result: dict, text: str, min_count: int = 2, limit: Optional[int] = None,
                 skip_top: int = 0, known: frozenset = frozenset()) -> List[dict]:
     """Pick frequent non-proper-noun lemmas and render a card for each.
@@ -680,7 +695,8 @@ def build_cards(result: dict, text: str, min_count: int = 2, limit: Optional[int
         sentence = next((sentences[f] for f in forms if f in sentences), "")
         if sentence:
             back += f"\n<p><strong>In the text:</strong> <em>{html_escape(sentence)}</em></p>"
-        cards.append({"front": lemma, "back": back, "count": count, "forms": forms})
+        cards.append({"front": lemma, "back": back, "count": count, "forms": forms,
+                      "audio_url": pick_audio_url(lemma_entries[lemma])})
     return cards
 
 
@@ -711,7 +727,8 @@ def add_cards_to_anki(cards: List[dict], lang: str, deck: str, note_type: str,
         exists = w.deck_exists(deck)
         notes = []
         for card in cards:
-            note = w.build_note(deck, card["front"], card["back"], None, lang, note_type)
+            note = w.build_note(deck, card["front"], card["back"], card.get("audio_url"),
+                                lang, note_type)
             note["tags"] = ["kaikki2card", f"kaikki2card::{lang}", *tags]
             notes.append(note)
         if exists:
@@ -765,7 +782,8 @@ def cmd_cards(args) -> int:
     print(f"{len(cards)} cards (lemmas seen >= {args.min_count} times, after skipping the "
           f"{args.skip_top} most frequent and {len(known)} known lemmas)\n")
     for card in cards[:args.preview]:
-        print(f"{card['front']}  ({card['count']}x: {', '.join(card['forms'][:5])})")
+        audio = "  [audio]" if card.get("audio_url") else ""
+        print(f"{card['front']}  ({card['count']}x: {', '.join(card['forms'][:5])}){audio}")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             tag_column = " ".join(["kaikki2card", f"kaikki2card::{args.lang}", *args.tag])

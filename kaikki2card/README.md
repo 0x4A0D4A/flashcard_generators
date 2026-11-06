@@ -140,8 +140,13 @@ first, so some picks are wrong or merely plausible (`bhean`->`bean`/`bain`,
   treebank text, lower on literary Irish) to choose between candidates;
   it has not been tried.
 - **Irish has almost no audio or examples in Wiktionary**: audio on 10 entries,
-  about 2,300 real examples. Cards carry the in-text sentence instead; audio is not
-  downloaded.
+  about 2,300 real examples. Cards carry the in-text sentence instead. French is
+  much better covered (about 23% of entries have a recording).
+- **Audio** is attached by `--anki` only: the first recording on the lemma's
+  entries (mp3 preferred) goes onto the Front field and AnkiConnect downloads
+  it from Wikimedia Commons. Cards already in the deck are skipped, so they do
+  not gain audio retroactively. `--out` TSVs carry no audio. `cards` marks
+  cards that have a recording with `[audio]` in the preview.
 - Etymology and some `forms` still contain template residue after cleaning
   (only the leading `X word\n form` header is stripped).
 - `--anki` is covered by tests against a fake AnkiConnect but has **not been run
