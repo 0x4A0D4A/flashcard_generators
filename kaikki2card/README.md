@@ -69,6 +69,22 @@ word. `--anki` reuses `../wikt2card`'s AnkiConnect helpers (so it needs
 `pip install -r ../wikt2card/requirements.txt`) and skips cards already in the
 deck. Nothing is written to Anki without `--anki`.
 
+### One deck, one tag per book
+
+Keep every book in a single deck and mark where each card came from with
+`--tag` (repeatable; no whitespace; `a::b` makes a hierarchical tag):
+
+```bash
+./kaikki2card.py cards --lang ga niamh.txt --anki --deck "Irish::Mining" --tag book::niamh
+./kaikki2card.py cards --lang ga ch03.txt  --anki --deck "Irish::Mining" --tag book::niamh --tag book::niamh::ch03
+```
+
+Cards also carry `kaikki2card` and `kaikki2card::<lang>`. A lemma that is
+already in the deck is skipped and left untouched, so it does **not** gain a
+later book's tag. To study one book, build a filtered deck in Anki with the
+search `deck:"Irish::Mining" tag:book::niamh is:new`. `--out` writes the same
+tags into the TSV's tag column.
+
 Tests are offline: `python3 -m pytest tests` (needs pytest and, for the Anki
 tests, `requests`/`beautifulsoup4`).
 
